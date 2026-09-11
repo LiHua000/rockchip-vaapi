@@ -163,6 +163,13 @@ typedef struct {
     RKContext  contexts[MAX_CONTEXTS];
     RKSurface  surfaces[MAX_SURFACES];
     RKBuffer   buffers [MAX_BUFFERS];
+
+    /* Serializes live object allocation / destruction.  ffmpeg decodes on
+     * one thread while the output thread vaCreateImage()/vaDestroyImage()s,
+     * both calling rk_CreateBuffer(); without this lock they can hand out
+     * the same slot and one thread's vaDestroyBuffer() frees the other
+     * thread's image buffer (=> vaGetImage "invalid surface"). */
+    pthread_mutex_t obj_mtx;
 } RKDriver;
 
 /* ── helpers ─────────────────────────────────────────────────── */
@@ -269,6 +276,7 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
     for (int i = 0; i < MAX_BUFFERS; i++) {
         if (d->buffers[i].used) free(d->buffers[i].data);
     }
+    pthread_mutex_destroy(&d->obj_mtx);
     free(d);
     ctx->pDriverData = NULL;
     return VA_STATUS_SUCCESS;
@@ -357,22 +365,27 @@ static VAStatus rk_CreateConfig(VADriverContextP ctx,
     (void)attribs; (void)n_attribs;
 
     for (unsigned i = 0; i < MAX_CONFIGS; i++) {
+        pthread_mutex_lock(&d->obj_mtx);
         if (!d->configs[i].used) {
             d->configs[i].used = true;
             d->configs[i].profile = profile;
             d->configs[i].entrypoint = entrypoint;
             *out_id = CONFIG_ID_BASE + i;
+            pthread_mutex_unlock(&d->obj_mtx);
             return VA_STATUS_SUCCESS;
         }
+        pthread_mutex_unlock(&d->obj_mtx);
     }
     return VA_STATUS_ERROR_ALLOCATION_FAILED;
 }
 
 static VAStatus rk_DestroyConfig(VADriverContextP ctx, VAConfigID id) {
     RKDriver *d = drv_from_ctx(ctx);
+    pthread_mutex_lock(&d->obj_mtx);
     RKConfig *c = config_by_id(d, id);
-    if (!c) return VA_STATUS_ERROR_INVALID_CONFIG;
+    if (!c) { pthread_mutex_unlock(&d->obj_mtx); return VA_STATUS_ERROR_INVALID_CONFIG; }
     c->used = false;
+    pthread_mutex_unlock(&d->obj_mtx);
     return VA_STATUS_SUCCESS;
 }
 
@@ -647,6 +660,7 @@ static VAStatus rk_CreateBuffer(VADriverContextP ctx,
     RKDriver *d = drv_from_ctx(ctx);
     (void)context;
 
+    pthread_mutex_lock(&d->obj_mtx);
     for (unsigned i = 0; i < MAX_BUFFERS; i++) {
         if (d->buffers[i].used) continue;
         RKBuffer *b = &d->buffers[i];
@@ -657,13 +671,16 @@ static VAStatus rk_CreateBuffer(VADriverContextP ctx,
         b->data         = malloc((size_t)size * num_elements);
         if (!b->data) {
             b->used = false;
+            pthread_mutex_unlock(&d->obj_mtx);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
         if (data) memcpy(b->data, data, (size_t)size * num_elements);
         else      memset(b->data, 0,    (size_t)size * num_elements);
         *out_id = BUFFER_ID_BASE + i;
+        pthread_mutex_unlock(&d->obj_mtx);
         return VA_STATUS_SUCCESS;
     }
+    pthread_mutex_unlock(&d->obj_mtx);
     return VA_STATUS_ERROR_ALLOCATION_FAILED;
 }
 
@@ -692,10 +709,13 @@ static VAStatus rk_UnmapBuffer(VADriverContextP ctx, VABufferID id) {
 
 static VAStatus rk_DestroyBuffer(VADriverContextP ctx, VABufferID id) {
     RKDriver *d = drv_from_ctx(ctx);
+    pthread_mutex_lock(&d->obj_mtx);
     RKBuffer *b = buffer_by_id(d, id);
-    if (!b) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!b) { pthread_mutex_unlock(&d->obj_mtx); return VA_STATUS_ERROR_INVALID_BUFFER; }
     free(b->data);
-    memset(b, 0, sizeof(*b));
+    b->data = NULL;
+    b->used = false;
+    pthread_mutex_unlock(&d->obj_mtx);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1724,6 +1744,7 @@ VAStatus __vaDriverInit_1_20(VADriverContextP ctx)  /* NOLINT */
     RKDriver *d = calloc(1, sizeof(*d));
     if (!d) return VA_STATUS_ERROR_ALLOCATION_FAILED;
     ctx->pDriverData = d;
+    pthread_mutex_init(&d->obj_mtx, NULL);
 
     ctx->version_major        = VA_MAJOR_VERSION;
     ctx->version_minor        = VA_MINOR_VERSION;
