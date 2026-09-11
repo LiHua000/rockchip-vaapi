@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <errno.h>
 
@@ -69,6 +70,16 @@ typedef struct {
     VAEntrypoint  entrypoint;
 } RKConfig;
 
+/* One complete access unit handed to the decode worker.  `buf` is malloc'd;
+ * the worker owns it, feeds it to MPP and frees it. */
+#define RK_JOB_CAP 12
+typedef struct {
+    uint8_t *data;      /* complete Annex-B access unit */
+    size_t   len;
+    VASurfaceID sid;    /* routed back via mpp packet pts */
+    int      nosync;    /* no surface waits on this job (VP9 altref) */
+} RKJob;
+
 typedef struct {
     bool         used;
     VAConfigID   config_id;
@@ -84,9 +95,17 @@ typedef struct {
 
     VASurfaceID  render_target;
 
-    /* FIFO queue of surfaces waiting for MPP decoded frames (in send order) */
-    VASurfaceID  decode_queue[64];
-    int          dq_head, dq_tail;
+    /* decode worker: MPP put/get is ONLY touched by this thread once the
+     * context starts it.  VA-API entry points enqueue access units here and
+     * wait on surface condvars instead of polling MPP. */
+    pthread_t         dec_thread;
+    pthread_mutex_t   jq_mtx;
+    pthread_cond_t    jq_not_empty;   /* worker waits (bounded timeout) */
+    pthread_cond_t    jq_not_full;    /* producer waits for a free slot */
+    RKJob             jq[RK_JOB_CAP];
+    int               jq_head, jq_tail, jq_n;
+    volatile int      dec_stop;
+    void             *dec_d;          /* RKDriver * (forward type) */
 
     /* H.264 state for SPS/PPS reconstruction */
     VAPictureParameterBufferH264 last_pp;
@@ -192,12 +211,26 @@ static int profile_idc(VAProfile p) {
     }
 }
 
+/* forward decls for the decode worker (defined further down) */
+static void rk_ctx_stop_worker(RKContext *c);
+static void *rk_decode_thread(void *arg);
+static VAStatus rk_enqueue_job(RKContext *c, const uint8_t *data, size_t len,
+                               VASurfaceID sid, int nosync);
+static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d);
+
 /* ── VADriverVTable implementations ──────────────────────────── */
 
 static VAStatus rk_Terminate(VADriverContextP ctx) {
     LOG("Terminate: cleaning up driver");
     RKDriver *d = drv_from_ctx(ctx);
     if (!d) return VA_STATUS_SUCCESS;
+
+    /* Stop all decode workers BEFORE freeing surfaces/contexts: a worker may
+     * still touch surfaces while draining MPP output. */
+    for (int i = 0; i < MAX_CONTEXTS; i++) {
+        if (!d->contexts[i].used) continue;
+        rk_ctx_stop_worker(&d->contexts[i]);
+    }
 
     /* destroy any leftover objects */
     for (int i = 0; i < MAX_SURFACES; i++) {
@@ -212,6 +245,9 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
     for (int i = 0; i < MAX_CONTEXTS; i++) {
         if (!d->contexts[i].used) continue;
         if (d->contexts[i].mpp) mpp_destroy(d->contexts[i].mpp);
+        pthread_mutex_destroy(&d->contexts[i].jq_mtx);
+        pthread_cond_destroy(&d->contexts[i].jq_not_empty);
+        pthread_cond_destroy(&d->contexts[i].jq_not_full);
     }
     for (int i = 0; i < MAX_BUFFERS; i++) {
         if (d->buffers[i].used) free(d->buffers[i].data);
@@ -505,6 +541,24 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         int block = 0;
         c->mpi->control(c->mpp, MPP_SET_OUTPUT_BLOCK, (MppParam)&block);
 
+        /* decode worker pump */
+        c->dec_d   = d;
+        c->jq_head = c->jq_tail = c->jq_n = 0;
+        c->dec_stop = 0;
+        pthread_mutex_init(&c->jq_mtx, NULL);
+        pthread_cond_init(&c->jq_not_empty, NULL);
+        pthread_cond_init(&c->jq_not_full, NULL);
+        if (pthread_create(&c->dec_thread, NULL, rk_decode_thread, c) != 0) {
+            LOG("CreateContext: decode worker thread FAILED");
+            pthread_mutex_destroy(&c->jq_mtx);
+            pthread_cond_destroy(&c->jq_not_empty);
+            pthread_cond_destroy(&c->jq_not_full);
+            mpp_destroy(c->mpp);
+            memset(c, 0, sizeof(*c));
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        LOG("CreateContext: decode worker thread started");
+
         c->used      = true;
         c->config_id = config_id;
         c->width     = width;
@@ -523,7 +577,11 @@ static VAStatus rk_DestroyContext(VADriverContextP ctx, VAContextID id) {
     RKDriver *d = drv_from_ctx(ctx);
     RKContext *c = context_by_id(d, id);
     if (!c) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    rk_ctx_stop_worker(c);
     if (c->mpp) mpp_destroy(c->mpp);
+    pthread_mutex_destroy(&c->jq_mtx);
+    pthread_cond_destroy(&c->jq_not_empty);
+    pthread_cond_destroy(&c->jq_not_full);
     memset(c, 0, sizeof(*c));
     return VA_STATUS_SUCCESS;
 }
@@ -651,24 +709,13 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     VASurfaceID sid     = (VASurfaceID)raw_pts;
     RKSurface  *s       = sid ? surface_by_id(d, sid) : NULL;
 
+    /* Pure PTS routing: every access unit carries its target VASurfaceID as
+     * the packet pts, so a frame can only ever be delivered to the surface it
+     * belongs to.  No `render_target` fallback here — that mutable per-context
+     * field was the cause of SyncSurface 3s timeouts under mpv's multi-surface
+     * pipeline (frame for surface A arriving while render_target had moved on). */
     if (!s) {
-        if (c->coding == MPP_VIDEO_CodingAVC) {
-            sid = c->render_target;
-        } else if (c->dq_head != c->dq_tail) {
-            sid = c->decode_queue[c->dq_head];
-            c->dq_head = (c->dq_head + 1) & 63;
-            LOG("assign_mpp_frame: PTS=0x%llx unmapped, FIFO → surface=0x%x",
-                (unsigned long long)raw_pts, (unsigned)sid);
-        }
-        s = sid ? surface_by_id(d, sid) : NULL;
-    } else if (c->coding != MPP_VIDEO_CodingAVC) {
-        /* PTS valid — advance FIFO head only if this surface is at the front */
-        if (c->dq_head != c->dq_tail && c->decode_queue[c->dq_head] == sid)
-            c->dq_head = (c->dq_head + 1) & 63;
-    }
-
-    if (!s) {
-        LOG("assign_mpp_frame: PTS=0x%llx surface not found, dropped",
+        LOG("assign_mpp_frame: PTS=0x%llx no matching surface, dropped",
             (unsigned long long)raw_pts);
         mpp_frame_deinit(&frame);
         return;
@@ -719,6 +766,142 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     pthread_mutex_unlock(&s->lock);
     LOG("assign_mpp_frame: surface=0x%x prime_fd=%d MPP %dx%d stride=%dx%d fmt=0x%x copied=%d",
         (unsigned)sid, s->prime_fd, fwidth, fheight, fhs, fvs, (unsigned)ffmt, copied);
+}
+
+/* ── decode worker (single-threaded MPP consumer) ──────────────── */
+
+/* Stop the worker and free any yet-unconsumed access units.  Never called
+ * while the worker could still dereference `c` (join strictly before any
+ * context storage is reused). */
+static void rk_ctx_stop_worker(RKContext *c)
+{
+    if (!c->dec_thread) return;
+    c->dec_stop = 1;
+    pthread_cond_signal(&c->jq_not_empty);
+    pthread_join(c->dec_thread, NULL);
+    c->dec_thread = 0;
+
+    pthread_mutex_lock(&c->jq_mtx);
+    while (c->jq_n > 0) {
+        RKJob *j = &c->jq[c->jq_head];
+        free(j->data);
+        j->data = NULL;
+        c->jq_head = (c->jq_head + 1) % RK_JOB_CAP;
+        c->jq_n--;
+    }
+    pthread_mutex_unlock(&c->jq_mtx);
+}
+
+/* Worker thread: the ONLY thread that calls decode_put_packet /
+ * decode_get_frame for this context.  VA-API entry points (EndPicture,
+ * SyncSurface) previously polled decode_get_frame from multiple threads,
+ * which made MPP return/route frames wrong and waited out the full 3s
+ * SyncSurface drain ~40% of the time at 4K.  Now they enqueue AUs and wait
+ * on surface condition variables instead. */
+static void *rk_decode_thread(void *arg)
+{
+    RKContext *c = (RKContext *)arg;
+    RKDriver  *d = (RKDriver *)c->dec_d;
+
+    while (!c->dec_stop) {
+        /* 1) harvest whatever MPP produced so far (non-blocking get) */
+        MppFrame f = NULL;
+        while (c->mpi->decode_get_frame(c->mpp, &f) == MPP_OK && f) {
+            assign_mpp_frame(f, c, d);
+            f = NULL;
+        }
+
+        /* 2) wait for a job (100ms timeout keeps draining late MPP output) */
+        pthread_mutex_lock(&c->jq_mtx);
+        while (c->jq_n == 0 && !c->dec_stop) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 100 * 1000 * 1000;
+            if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
+            if (pthread_cond_timedwait(&c->jq_not_empty, &c->jq_mtx, &ts) == ETIMEDOUT)
+                break;
+        }
+        if (c->dec_stop) {
+            pthread_mutex_unlock(&c->jq_mtx);
+            break;
+        }
+        int have = c->jq_n > 0;
+        RKJob job;
+        if (have) {
+            job = c->jq[c->jq_head];        /* struct copy (data is a ptr) */
+            c->jq_head = (c->jq_head + 1) % RK_JOB_CAP;
+            c->jq_n--;
+        }
+        pthread_cond_signal(&c->jq_not_full);
+        pthread_mutex_unlock(&c->jq_mtx);
+
+        if (!have) continue;    /* idle timeout; loop drains again */
+
+        /* 3) feed MPP, retrying if its input queue is briefly full */
+        MPP_RET ret;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            MppPacket pkt = NULL;
+            mpp_packet_init(&pkt, job.data, job.len);
+            mpp_packet_set_length(pkt, job.len);
+            mpp_packet_set_pts(pkt, (RK_S64)job.sid);
+            ret = c->mpi->decode_put_packet(c->mpp, pkt);
+            mpp_packet_deinit(&pkt);
+            if (ret != MPP_ERR_BUFFER_FULL) break;
+            /* input queue wedged: drain a little, then retry */
+            MppFrame f2 = NULL;
+            while (c->mpi->decode_get_frame(c->mpp, &f2) == MPP_OK && f2) {
+                assign_mpp_frame(f2, c, d);
+                f2 = NULL;
+            }
+            usleep(1000);
+        }
+        if (ret != MPP_OK)
+            LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
+                (int)ret, job.len, (unsigned)job.sid);
+        else
+            LOG("decode worker: put len=%zu sid=0x%x", job.len, (unsigned)job.sid);
+        free(job.data);
+    }
+    return NULL;
+}
+
+/* Copy one access unit into the job ring for the worker.  Bounded wait for a
+ * free slot; called from VA-API EndPicture. */
+static VAStatus rk_enqueue_job(RKContext *c, const uint8_t *data, size_t len,
+                               VASurfaceID sid, int nosync)
+{
+    if (c->dec_stop || !data || !len) return VA_STATUS_SUCCESS;
+
+    pthread_mutex_lock(&c->jq_mtx);
+    while (c->jq_n >= RK_JOB_CAP && !c->dec_stop) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000 * 1000;          /* 1ms */
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
+        if (pthread_cond_timedwait(&c->jq_not_full, &c->jq_mtx, &ts) == ETIMEDOUT)
+            break;
+    }
+    if (c->dec_stop || c->jq_n >= RK_JOB_CAP) {
+        pthread_mutex_unlock(&c->jq_mtx);
+        LOG("enqueue: queue still full, dropping AU sid=0x%x", (unsigned)sid);
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+    void *copy = malloc(len);
+    if (!copy) {
+        pthread_mutex_unlock(&c->jq_mtx);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+    memcpy(copy, data, len);
+    RKJob *j = &c->jq[c->jq_tail];
+    j->data   = copy;
+    j->len    = len;
+    j->sid    = sid;
+    j->nosync = nosync;
+    c->jq_tail = (c->jq_tail + 1) % RK_JOB_CAP;
+    c->jq_n++;
+    pthread_cond_signal(&c->jq_not_empty);
+    pthread_mutex_unlock(&c->jq_mtx);
+    return VA_STATUS_SUCCESS;
 }
 
 /* Build Annex B bitstream from VA-API buffers and send to MPP */
@@ -787,46 +970,14 @@ static VAStatus do_h264_decode(RKContext *c, RKDriver *d)
         return VA_STATUS_SUCCESS;
     }
 
-    /* Pre-drain: consume frames MPP already has ready from previous packets */
-    {
-        MppFrame f = NULL;
-        while (c->mpi->decode_get_frame(c->mpp, &f) == MPP_OK && f) {
-            assign_mpp_frame(f, c, d);
-            f = NULL;
-        }
-    }
-
-    LOG("do_h264_decode: sending %zu bytes target=0x%x", pkt_sz, (unsigned)c->render_target);
-    MppPacket pkt = NULL;
-    mpp_packet_init(&pkt, pkt_data, pkt_sz);
-    mpp_packet_set_length(pkt, pkt_sz);
-    mpp_packet_set_pts(pkt, (RK_S64)c->render_target);
-
-    MPP_RET ret = c->mpi->decode_put_packet(c->mpp, pkt);
-    mpp_packet_deinit(&pkt);
+    /* Hand the full access unit to the decode worker.  The worker owns
+     * decode_put_packet / decode_get_frame; VA-API threads never touch MPP
+     * directly (that concurrent access previously stalled SyncSurface). */
+    LOG("do_h264_decode: submit %zu bytes target=0x%x",
+        pkt_sz, (unsigned)c->render_target);
+    VAStatus st = rk_enqueue_job(c, pkt_data, pkt_sz, c->render_target, 0);
     free(pkt_data);
-
-    if (ret != MPP_OK) {
-        LOG("decode_put_packet failed: %d", ret);
-        return VA_STATUS_ERROR_DECODING_ERROR;
-    }
-
-    for (int tries = 0; tries < 100; tries++) {
-        RKSurface *tgt = surface_by_id(d, c->render_target);
-        if (tgt) {
-            pthread_mutex_lock(&tgt->lock);
-            bool done = tgt->decoded;
-            pthread_mutex_unlock(&tgt->lock);
-            if (done) break;
-        }
-        MppFrame frame = NULL;
-        if (c->mpi->decode_get_frame(c->mpp, &frame) == MPP_OK && frame)
-            assign_mpp_frame(frame, c, d);
-        else
-            usleep(1000);
-    }
-
-    return VA_STATUS_SUCCESS;
+    return st;
 }
 
 /* Return false for VP9 altref / non-displayed frames (show_frame=0).
@@ -891,55 +1042,12 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
     }
 
     /* Detect VP9 altref (show_frame=0): MPP decodes them as references but does
-     * NOT output them via decode_get_frame in this environment, so we never
-     * poll/block for them — see the is_hidden handling after decode_put_packet. */
+     * NOT output them via decode_get_frame in this environment.  The surface is
+     * marked decoded immediately (placeholder prime_fd stays valid) and the job
+     * is submitted with nosync=1 so nothing ever blocks for its output. */
     bool is_hidden = (c->coding == MPP_VIDEO_CodingVP9) &&
                      !vp9_show_frame(pkt_data, pkt_sz);
 
-    /* Pre-drain: consume any frames MPP already has ready from previous
-     * packets.  Keyframes that timed out in the previous EndPicture poll
-     * window land here at the start of the next call. */
-    {
-        MppFrame f = NULL;
-        while (c->mpi->decode_get_frame(c->mpp, &f) == MPP_OK && f) {
-            assign_mpp_frame(f, c, d);
-            f = NULL;
-        }
-    }
-
-    /* Enqueue this surface into the FIFO decode queue (PTS-routing fallback).
-     * Altref frames are skipped: MPP never outputs them, so enqueuing would
-     * leave a permanent entry the head can never advance past. */
-    if (!is_hidden) {
-        c->decode_queue[c->dq_tail] = c->render_target;
-        c->dq_tail = (c->dq_tail + 1) & 63;
-    }
-
-    LOG("do_generic_decode: sending %zu bytes to MPP (coding=%d) target=0x%x%s",
-        pkt_sz, (int)c->coding, (unsigned)c->render_target,
-        is_hidden ? " [altref]" : "");
-    MppPacket pkt = NULL;
-    mpp_packet_init(&pkt, pkt_data, pkt_sz);
-    mpp_packet_set_length(pkt, pkt_sz);
-    mpp_packet_set_pts(pkt, (RK_S64)c->render_target);
-
-    MPP_RET ret = c->mpi->decode_put_packet(c->mpp, pkt);
-    mpp_packet_deinit(&pkt);
-    free(pkt_data);
-
-    if (ret != MPP_OK) {
-        LOG("decode_put_packet failed: %d", ret);
-        if (!is_hidden) c->dq_tail = (c->dq_tail - 1) & 63; /* undo enqueue */
-        return VA_STATUS_ERROR_DECODING_ERROR;
-    }
-
-    /* Altref frames (show_frame=0): MPP decodes them internally as references
-     * but never outputs them via decode_get_frame here, and ffmpeg never syncs
-     * or displays a hidden frame directly.  So do NOT poll — that would block
-     * the decode thread for the whole poll window per altref, accumulating
-     * latency until Firefox's pipeline underruns (NS_ERROR_DOM_MEDIA_FATAL_ERR).
-     * Just mark the surface decoded immediately; its permanent prime_fd stays
-     * valid (placeholder content) so ExportSurfaceHandle always succeeds. */
     if (is_hidden) {
         RKSurface *tgt = surface_by_id(d, c->render_target);
         if (tgt) {
@@ -948,15 +1056,14 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
             pthread_cond_signal(&tgt->cond);
             pthread_mutex_unlock(&tgt->lock);
         }
-        return VA_STATUS_SUCCESS;
     }
 
-    /* Do NOT poll here — return immediately so Firefox's decode thread is never
-     * stalled. 4K keyframes (835KB) can take >1.6s in MPP; blocking EndPicture
-     * for that long freezes Firefox's media pipeline and triggers NS_ERROR at
-     * DASH segment boundaries. SyncSurface already has a drain loop and is the
-     * correct place to wait for the decoded frame. */
-    return VA_STATUS_SUCCESS;
+    LOG("do_generic_decode: submit %zu bytes to MPP (coding=%d) target=0x%x%s",
+        pkt_sz, (int)c->coding, (unsigned)c->render_target,
+        is_hidden ? " [altref]" : "");
+    VAStatus st = rk_enqueue_job(c, pkt_data, pkt_sz, c->render_target, is_hidden);
+    free(pkt_data);
+    return st;
 }
 
 static VAStatus rk_EndPicture(VADriverContextP ctx, VAContextID ctx_id) {
@@ -981,7 +1088,6 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
 
     pthread_mutex_lock(&s->lock);
     bool ready  = s->decoded || (s->ctx_id == 0);  /* not started = placeholder valid */
-    VAContextID cid = s->ctx_id;
     pthread_mutex_unlock(&s->lock);
 
     if (ready) {
@@ -989,42 +1095,28 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
         return VA_STATUS_SUCCESS;
     }
 
-    /* EndPicture already polled 500ms; if the surface still isn't decoded
-     * (B-frame pipeline priming, slow keyframe), actively drain MPP here
-     * instead of sleeping on a cond that will never be signalled. */
-    RKContext *c = context_by_id(d, cid);
+    /* Wait for the decode worker to deliver this surface's frame.  The worker
+     * is the only thread that calls decode_get_frame, so no active draining
+     * here (that shared get was what stalled the pipeline before). */
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 3;
 
-    LOG("SyncSurface: surface=0x%x draining MPP ctx=0x%x", id, cid);
-    for (;;) {
-        pthread_mutex_lock(&s->lock);
-        bool done = s->decoded;
-        pthread_mutex_unlock(&s->lock);
-        if (done) { LOG("SyncSurface: surface=0x%x OK prime_fd=%d", id, s->prime_fd); break; }
-
-        struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+    pthread_mutex_lock(&s->lock);
+    int done = s->decoded;
+    while (!done) {
+        int rc = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
+        if (rc == ETIMEDOUT) {
             LOG("SyncSurface: TIMEOUT surface=0x%x prime_fd=%d", id, s->prime_fd);
             break;
         }
-
-        if (c) {
-            MppFrame frame = NULL;
-            if (c->mpi->decode_get_frame(c->mpp, &frame) == MPP_OK && frame) {
-                assign_mpp_frame(frame, c, d);
-                continue; /* recheck immediately without sleeping */
-            }
-        }
-        usleep(1000);
+        done = s->decoded;
     }
-    pthread_mutex_lock(&s->lock);
-    bool final_ok = s->decoded;
     pthread_mutex_unlock(&s->lock);
-    return final_ok ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_DECODING_ERROR;
+
+    LOG("SyncSurface: surface=0x%x %s prime_fd=%d",
+        id, done ? "OK" : "TIMEOUT", s->prime_fd);
+    return done ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_DECODING_ERROR;
 }
 
 static VAStatus rk_SyncSurface2(VADriverContextP ctx,
