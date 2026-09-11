@@ -859,6 +859,41 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     int            fvs    = (int)mpp_frame_get_ver_stride(frame);
     MppFrameFormat ffmt   = mpp_frame_get_fmt(frame);
 
+    /* Detect MPP decode-failure frames (blank/zero content = one-frame green
+     * flash at 4K).  Sample the first rows of Y + MPP err/discard flags. */
+    RK_U32 errp = mpp_frame_get_errinfo(frame);
+    RK_U32 disc = mpp_frame_get_discard(frame);
+    bool zeroish = false;
+    if (buf) {
+        const uint8_t *ypg = (const uint8_t *)mpp_buffer_get_ptr(buf);
+        if (ypg) {
+            RK_S64 acc = 0;
+            int rmax = (fheight > 0 && fheight < 4) ? fheight : 4;
+            int cmax = (fhs > 0 && fhs < 128) ? fhs : 128;
+            for (int r = 0; r < rmax; r++)
+                for (int c = 0; c < cmax; c++)
+                    acc += ypg[(size_t)r * (size_t)(fhs > 0 ? fhs : 1) + (size_t)c];
+            zeroish = (acc == 0);
+        }
+    }
+    LOG("assign: sid=0x%x err=%u disc=%u zeroish=%d",
+        (unsigned)sid, (unsigned)errp, (unsigned)disc, zeroish ? 1 : 0);
+
+    /* MPP decode-failure protection: a blank/zeroed or error-flagged frame
+     * would display as a one-frame green flash.  Treat it as a dropped frame
+     * and KEEP the previous content (or neutral gray) instead of copying
+     * garbage. */
+    if (errp || zeroish) {
+        LOG("assign: sid=0x%x MPP blank/err frame dropped (err=%u disc=%u zeroish=%d)",
+            (unsigned)sid, (unsigned)errp, (unsigned)disc, zeroish ? 1 : 0);
+        pthread_mutex_lock(&s->lock);
+        s->decoded = true;
+        pthread_cond_signal(&s->cond);
+        pthread_mutex_unlock(&s->lock);
+        mpp_frame_deinit(&frame);
+        return;
+    }
+
     int  copy_w = fwidth  > 0 ? fwidth  : s->width;
     int  copy_h = fheight > 0 ? fheight : s->height;
     int  src_hs = fhs > 0 ? fhs : copy_w;
