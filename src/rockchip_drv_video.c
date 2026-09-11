@@ -73,6 +73,11 @@ typedef struct {
 /* One complete access unit handed to the decode worker.  `buf` is malloc'd;
  * the worker owns it, feeds it to MPP and frees it. */
 #define RK_JOB_CAP 12
+/* Number of per-surface output buffers.  A frame exported to GL/EGL stays
+ * intact for at least this many subsequent frames before being overwritten
+ * (triple-buffer); without it the app's lingering texture aliases the next
+ * decode = tearing/flicker even with correct content. */
+#define PRIV_RING 3
 typedef struct {
     uint8_t *data;      /* complete Annex-B access unit */
     size_t   len;
@@ -158,7 +163,10 @@ typedef struct {
      * Also serves as the pre-decode placeholder for ExportSurfaceHandle
      * capability probes (Firefox DMABUF probe before any decode). */
     MppBufferGroup priv_group;
-    MppBuffer      priv_buf;
+    MppBuffer      priv_buf;      /* active ring slot used for copy/export */
+    int            rslot;         /* next ring slot to write */
+    MppBuffer      priv_ring[PRIV_RING];
+    int            prime_ring[PRIV_RING];
 
     MppFrameFormat fmt;     /* pixel format of last decoded frame (0 = NV12 default) */
     bool         decoded;
@@ -274,8 +282,10 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
         if (d->surfaces[i].frame) mpp_frame_deinit(&d->surfaces[i].frame);
         if (d->surfaces[i].last_frame) mpp_frame_deinit(&d->surfaces[i].last_frame);
         if (d->surfaces[i].export_fd > 0) close(d->surfaces[i].export_fd);
-        if (d->surfaces[i].prime_fd >= 0) close(d->surfaces[i].prime_fd);
-        if (d->surfaces[i].priv_buf)   mpp_buffer_put(d->surfaces[i].priv_buf);
+        for (int r = 0; r < PRIV_RING; r++) {
+            if (d->surfaces[i].prime_ring[r] > 0) close(d->surfaces[i].prime_ring[r]);
+            if (d->surfaces[i].priv_ring[r])      mpp_buffer_put(d->surfaces[i].priv_ring[r]);
+        }
         if (d->surfaces[i].priv_group) mpp_buffer_group_put(d->surfaces[i].priv_group);
         pthread_cond_destroy(&d->surfaces[i].cond);
         pthread_mutex_destroy(&d->surfaces[i].lock);
@@ -448,8 +458,12 @@ static VAStatus rk_CreateSurfaces(VADriverContextP ctx,
             for (int j = 0; j < allocated; j++) {
                 unsigned idx = ids[j] - SURFACE_ID_BASE;
                 RKSurface *rb = &d->surfaces[idx];
-                if (rb->prime_fd >= 0) close(rb->prime_fd);
-                if (rb->priv_buf)   mpp_buffer_put(rb->priv_buf);
+                if (rb->export_fd > 0) close(rb->export_fd);
+                if (rb->last_frame) mpp_frame_deinit(&rb->last_frame);
+                for (int r = 0; r < PRIV_RING; r++) {
+                    if (rb->prime_ring[r] > 0) close(rb->prime_ring[r]);
+                    if (rb->priv_ring[r])      mpp_buffer_put(rb->priv_ring[r]);
+                }
                 if (rb->priv_group) mpp_buffer_group_put(rb->priv_group);
                 pthread_mutex_destroy(&rb->lock);
                 pthread_cond_destroy(&rb->cond);
@@ -466,41 +480,57 @@ static VAStatus rk_CreateSurfaces(VADriverContextP ctx,
         surf->export_fd  = -1;   /* fd 0 is a valid-return but we treat <=0 as "none" */
         surf->last_frame = NULL;
 
-        /* Pre-allocate placeholder DMA-BUF so ExportSurfaceHandle succeeds
-         * before any decode (e.g. Firefox's DMABUF capability probe). */
+        /* Pre-allocate PRIV_RING placeholder DMA-BUFs (neutral gray, NOT zeroed =
+         * green) so ExportSurfaceHandle always has a stable fd and a frame
+         * exported to GL stays intact for several decode cycles. */
         {
             unsigned hs = (unsigned)((width  + 15) & ~15);
             unsigned vs = (unsigned)((height + 15) & ~15);
             MppBufferGroup grp = NULL;
-            MppBuffer      buf = NULL;
-            if (mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_DRM) == MPP_OK &&
-                mpp_buffer_get(grp, &buf, hs * vs * 3) == MPP_OK) {
-                int raw_fd = mpp_buffer_get_fd(buf);
-                int dup_fd = (raw_fd > 0) ? dup(raw_fd) : -1;
-                if (dup_fd > 0) {
-                    /* Neutral placeholder (gray NV12, NOT zeroed = green) so
-                     * any pre-decode/stale export never shows a green frame. */
-                    uint8_t *ph = (uint8_t *)mpp_buffer_get_ptr(buf);
-                    if (ph) {
-                        memset(ph, 80, (size_t)hs * vs);
-                        memset(ph + (size_t)hs * vs, 128,
-                               (size_t)hs * vs * 3 - (size_t)hs * vs);
+            if (mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_DRM) == MPP_OK) {
+                int ok = 1;
+                for (int r = 0; r < PRIV_RING && ok; r++) {
+                    MppBuffer buf = NULL;
+                    if (mpp_buffer_get(grp, &buf, hs * vs * 3) == MPP_OK) {
+                        int raw_fd = mpp_buffer_get_fd(buf);
+                        int dup_fd = (raw_fd > 0) ? dup(raw_fd) : -1;
+                        if (dup_fd > 0) {
+                            uint8_t *ph = (uint8_t *)mpp_buffer_get_ptr(buf);
+                            if (ph) {
+                                memset(ph, 80, (size_t)hs * vs);
+                                memset(ph + (size_t)hs * vs, 128,
+                                       (size_t)hs * vs * 3 - (size_t)hs * vs);
+                            }
+                            surf->priv_ring[r]   = buf;
+                            surf->prime_ring[r]  = dup_fd;
+                        } else {
+                            mpp_buffer_put(buf);
+                            ok = 0;
+                        }
+                    } else {
+                        ok = 0;
                     }
+                }
+                if (ok) {
                     surf->priv_group = grp;
-                    surf->priv_buf   = buf;
-                    surf->prime_fd   = dup_fd;
+                    surf->rslot      = 0;
+                    surf->priv_buf   = surf->priv_ring[0];
+                    surf->prime_fd   = surf->prime_ring[0];
                     surf->hstride    = (int)hs;
                     surf->vstride    = (int)vs;
-                    LOG("CreateSurfaces: surface %ux%u placeholder prime_fd=%d",
-                        (unsigned)width, (unsigned)height, surf->prime_fd);
+                    LOG("CreateSurfaces: surface %ux%u placeholder prime_fd=%d ring=%d",
+                        (unsigned)width, (unsigned)height, surf->prime_fd, PRIV_RING);
                 } else {
-                    LOG("CreateSurfaces: mpp_buffer_get_fd failed (raw_fd=%d), no placeholder", raw_fd);
-                    mpp_buffer_put(buf);
+                    for (int r = 0; r < PRIV_RING; r++) {
+                        if (surf->prime_ring[r] > 0) close(surf->prime_ring[r]);
+                        if (surf->priv_ring[r])      mpp_buffer_put(surf->priv_ring[r]);
+                    }
                     mpp_buffer_group_put(grp);
+                    memset(surf->prime_ring, 0, sizeof(surf->prime_ring));
+                    memset(surf->priv_ring, 0, sizeof(surf->priv_ring));
+                    LOG("CreateSurfaces: placeholder alloc failed, prime_fd=-1");
                 }
             } else {
-                if (buf) mpp_buffer_put(buf);
-                if (grp) mpp_buffer_group_put(grp);
                 LOG("CreateSurfaces: placeholder alloc failed, prime_fd=-1");
             }
         }
@@ -523,8 +553,10 @@ static VAStatus rk_DestroySurfaces(VADriverContextP ctx,
         if (s->frame)      mpp_frame_deinit(&s->frame);
         if (s->last_frame) mpp_frame_deinit(&s->last_frame);
         if (s->export_fd > 0) close(s->export_fd);
-        if (s->prime_fd >= 0) close(s->prime_fd);
-        if (s->priv_buf)   { mpp_buffer_put(s->priv_buf);        s->priv_buf   = NULL; }
+        for (int r = 0; r < PRIV_RING; r++) {
+            if (s->prime_ring[r] > 0) close(s->prime_ring[r]);
+            if (s->priv_ring[r])      mpp_buffer_put(s->priv_ring[r]);
+        }
         if (s->priv_group) { mpp_buffer_group_put(s->priv_group); s->priv_group = NULL; }
         pthread_cond_destroy(&s->cond);
         pthread_mutex_destroy(&s->lock);
@@ -930,6 +962,11 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     }
 
     if (keep_copy) {
+        /* Rotate the per-surface ring so the buffer exported for THIS frame
+         * is not overwritten until PRIV_RING frames later (tearing fix). */
+        s->rslot = (s->rslot + 1) % PRIV_RING;
+        s->priv_buf = s->priv_ring[s->rslot];
+        s->prime_fd = s->prime_ring[s->rslot];
         void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
         void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
         if (src && dst) {
