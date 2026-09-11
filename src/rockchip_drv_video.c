@@ -1239,9 +1239,37 @@ static VAStatus do_h264_decode(RKContext *c, RKDriver *d)
         int n = h264_write_sps(hdr, sizeof(hdr), &c->last_pp,
                                profile_idc(config_by_id(d, c->config_id)->profile));
         if (n > 0) { PKT_APPEND(hdr, (size_t)n); }
+        if (getenv("RK_VAAPI_DEBUGSPS") && n > 0) {
+            static bool dbg_done = false;
+            if (!dbg_done) {
+                char hex[1024]; size_t hp = 0;
+                for (int i = 0; i < n && hp + 2 < sizeof(hex); i++) {
+                    static const char *hm = "0123456789abcdef";
+                    hex[hp++] = hm[(hdr[i] >> 4) & 0xF];
+                    hex[hp++] = hm[hdr[i] & 0xF];
+                }
+                hex[hp] = 0;
+                LOG("DBG SPS hex: %s", hex);
+                dbg_done = true;
+            }
+        }
 
         n = h264_write_pps(hdr, sizeof(hdr), &c->last_pp);
         if (n > 0) { PKT_APPEND(hdr, (size_t)n); }
+        if (getenv("RK_VAAPI_DEBUGSPS") && n > 0) {
+            static bool dbg_pp_done = false;
+            if (!dbg_pp_done) {
+                char hex[1024]; size_t hp = 0;
+                for (int i = 0; i < n && hp + 2 < sizeof(hex); i++) {
+                    static const char *hm = "0123456789abcdef";
+                    hex[hp++] = hm[(hdr[i] >> 4) & 0xF];
+                    hex[hp++] = hm[hdr[i] & 0xF];
+                }
+                hex[hp] = 0;
+                LOG("DBG PPS hex: %s", hex);
+                dbg_pp_done = true;
+            }
+        }
 
         c->sps_sent = true;
     }
