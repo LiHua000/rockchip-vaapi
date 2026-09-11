@@ -920,7 +920,11 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
             for (int r = 0; r < 3; r++)
                 for (int c = 0; c < 3; c++)
                     uu += pg[uvoff + (size_t)(upr[r] / 2) * (size_t)fhs + (size_t)(upc[c] & ~1u)];
-            blank = (mn == 0 && mx == 0) || (var < 4.0) || (uu == 0);
+            /* Only treat ALL-BLACK frames as blank pre-copy.  The aggressive
+             * std<2 rule mis-dropped many legitimate low-detail frames at
+             * ss=50 (84 false blanks).  The "Y ok but chroma missing" case is
+             * handled by the post-copy green guard on the displayed slot. */
+            blank = (mn == 0 && mx == 0) || (mean < 4.0 && var < 1.0) || (uu == 0 && mean < 4.0);
         }
     }
     if (blank || errp)
