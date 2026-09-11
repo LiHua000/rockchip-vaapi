@@ -875,29 +875,42 @@ static void *rk_decode_thread(void *arg)
 
         if (!have) continue;    /* idle timeout; loop drains again */
 
-        /* 3) feed MPP, retrying if its input queue is briefly full */
-        MPP_RET ret;
-        for (int attempt = 0; attempt < 8; attempt++) {
-            MppPacket pkt = NULL;
-            mpp_packet_init(&pkt, job.data, job.len);
-            mpp_packet_set_length(pkt, job.len);
-            mpp_packet_set_pts(pkt, (RK_S64)job.sid);
-            ret = c->mpi->decode_put_packet(c->mpp, pkt);
-            mpp_packet_deinit(&pkt);
-            if (ret != MPP_ERR_BUFFER_FULL) break;
-            /* input queue wedged: drain a little, then retry */
-            MppFrame f2 = NULL;
-            while (c->mpi->decode_get_frame(c->mpp, &f2) == MPP_OK && f2) {
-                assign_mpp_frame(f2, c, d);
-                f2 = NULL;
+        /* 3) feed MPP.  decode_put_packet can legitimately return
+         *    MPP_ERR_BUFFER_FULL (-1012 in this MPP) when the hardware is
+         *    still chewing on the previous access units (easy at 4K: a DPB of
+         *    frames in flight fills the input queue).  Never drop the AU —
+         *    pumping output in between gives the parser room, and the retry
+         *    only stops when the context is being torn down. */
+        if (job.len) {
+            MPP_RET ret = MPP_OK;
+            while (!c->dec_stop) {
+                MppPacket pkt = NULL;
+                mpp_packet_init(&pkt, job.data, job.len);
+                mpp_packet_set_length(pkt, job.len);
+                mpp_packet_set_pts(pkt, (RK_S64)job.sid);
+                ret = c->mpi->decode_put_packet(c->mpp, pkt);
+                mpp_packet_deinit(&pkt);
+                if (ret != MPP_ERR_BUFFER_FULL)
+                    break;
+                /* drain one output to make room, then retry shortly */
+                MppFrame f2 = NULL;
+                if (c->mpi->decode_get_frame(c->mpp, &f2) == MPP_OK && f2) {
+                    assign_mpp_frame(f2, c, d);
+                    continue;
+                }
+                struct timespec ts;
+                ts.tv_sec  = 0;
+                ts.tv_nsec = 2000 * 1000;   /* 2ms */
+                nanosleep(&ts, NULL);
             }
-            usleep(1000);
+            if (!c->dec_stop) {
+                if (ret != MPP_OK)
+                    LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
+                        (int)ret, job.len, (unsigned)job.sid);
+                else
+                    LOG("decode worker: put len=%zu sid=0x%x", job.len, (unsigned)job.sid);
+            }
         }
-        if (ret != MPP_OK)
-            LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
-                (int)ret, job.len, (unsigned)job.sid);
-        else
-            LOG("decode worker: put len=%zu sid=0x%x", job.len, (unsigned)job.sid);
         free(job.data);
     }
     return NULL;
