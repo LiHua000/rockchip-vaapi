@@ -984,6 +984,35 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
                        (size_t)src_hs * bpp);
             copied = 1;
         }
+        /* Post-copy green guard: some MPP frames carry Y but missing/zeroed
+         * chroma (solid green on screen).  Blank probe above can miss them.
+         * Inspect the DISPLAYED slot; if chroma ~0 while luma has content,
+         * revert the ring to the previous good frame (export/GetImage keep
+         * the last valid picture instead of green). */
+        if (copied) {
+            const uint8_t *pd = (const uint8_t *)mpp_buffer_get_ptr(s->priv_buf);
+            if (pd && fhs > 0 && fvs > 0) {
+                const int pr[5] = { 2, fheight / 4, fheight / 2, 3 * fheight / 4, fheight - 3 };
+                const int cv[5] = { 16, fwidth / 4, fwidth / 2, 3 * fwidth / 4, fwidth - 17 };
+                long ysum = 0, usum = 0;
+                for (int r = 0; r < 5; r++)
+                    for (int c = 0; c < 5; c++) {
+                        size_t yi = (size_t)pr[r] * (size_t)fhs + (size_t)cv[c];
+                        size_t ui = (size_t)fhs * (size_t)fvs + (size_t)(pr[r]/2) * (size_t)fhs + (size_t)(cv[c] & ~1u);
+                        ysum += pd[yi];
+                        usum += pd[ui];
+                    }
+                int ym = (int)(ysum / 25), um = (int)(usum / 25);
+                if (ym > 40 && um < 8) {
+                    LOG("assign: sid=0x%x GREEN chroma-missing ym=%d um=%d fhs=%d fvs=%d fmt=0x%x -> revert",
+                        (unsigned)sid, ym, um, fhs, fvs, (unsigned)ffmt);
+                    s->rslot    = (s->rslot + PRIV_RING - 1) % PRIV_RING;
+                    s->priv_buf = s->priv_ring[s->rslot];
+                    s->prime_fd = s->prime_ring[s->rslot];
+                    copied = 0;
+                }
+            }
+        }
     }
 
     /* Replace the previously pinned frame (buffer returns to MPP pool). */
