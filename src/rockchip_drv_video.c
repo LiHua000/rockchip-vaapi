@@ -860,39 +860,39 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     MppFrameFormat ffmt   = mpp_frame_get_fmt(frame);
 
     /* Detect MPP decode-failure frames (blank/zero content = one-frame green
-     * flash at 4K).  Sample a 3x3 grid of Y pixels (edges + center) so a
-     * genuine frame with ANY content is never misjudged (top-left corners are
-     * often letterbox-black). */
+     * flash at 4K).  5x5 scatter-grip Y probe: require meaningful variation
+     * (std >= 2) AND nonzero samples; missing-chroma UV (all-zero UV =>
+     * pure green) also counts as blank. */
     RK_U32 errp = mpp_frame_get_errinfo(frame);
     RK_U32 disc = mpp_frame_get_discard(frame);
     bool blank = false;
-    if (buf && fwidth > 0 && fheight > 0) {
+    if (buf && fwidth > 0 && fheight > 0 && fhs > 0) {
         const uint8_t *pg = (const uint8_t *)mpp_buffer_get_ptr(buf);
         if (pg) {
-            /* Y grid */
-            const int pr[3] = { 1, fheight / 2, fheight - 2 };
-            const int pc[3] = { 8, fwidth  / 2, fwidth  - 9 };
-            RK_S64 yy = 0;
-            for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 3; c++)
-                    yy += pg[(size_t)(pr[r] * (fhs > 0 ? fhs : fwidth)) + (size_t)pc[c]];
-            /* NV12 UV plane grid: UV starts at fhs*fvs; row stride = fhs,
-             * two chroma bytes per pixel.  All-zero UV (missing chroma)
-             * decodes to pure green, so it must also count as "blank". */
+            const int pr[5] = { 2, fheight / 4, fheight / 2, 3 * fheight / 4, fheight - 3 };
+            const int pc[5] = { 16, fwidth / 4, fwidth / 2, 3 * fwidth / 4, fwidth - 17 };
+            RK_S64 sum = 0; RK_U64 sum2 = 0; int mn = 255, mx = 0;
+            for (int r = 0; r < 5; r++)
+                for (int c = 0; c < 5; c++) {
+                    int v = pg[(size_t)pr[r] * (size_t)fhs + (size_t)pc[c]];
+                    sum += v; sum2 += (unsigned)v * (unsigned)v;
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+            double mean = (double)sum / 25.0;
+            double var  = (double)((double)sum2 / 25.0 - mean * mean);
+            size_t uvoff = (size_t)fhs * (size_t)(fvs > 0 ? fvs : fheight);
             RK_S64 uu = 0;
-            size_t uvoff = (size_t)(fhs > 0 ? fhs : fwidth) * (size_t)(fvs > 0 ? fvs : fheight);
             const int upr[3] = { fheight / 4, fheight / 2, 3 * fheight / 4 };
             const int upc[3] = { 8, fwidth / 2, fwidth - 9 };
             for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 3; c++) {
-                    size_t r0 = (size_t)(upr[r] / 2);
-                    uu += pg[uvoff + r0 * (size_t)(fhs) + (size_t)(upc[c] & ~1u)];
-                }
-            blank = (yy == 0) || (uu == 0);
+                for (int c = 0; c < 3; c++)
+                    uu += pg[uvoff + (size_t)(upr[r] / 2) * (size_t)fhs + (size_t)(upc[c] & ~1u)];
+            blank = (mn == 0 && mx == 0) || (var < 4.0) || (uu == 0);
         }
     }
-    LOG("assign: sid=0x%x err=%u disc=%u blank=%d %s",
-        (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0, blank ? "(Y/UV zero)" : "");
+    LOG("assign: sid=0x%x err=%u disc=%u blank=%d",
+        (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0);
 
     /* MPP decode-failure protection: a blank/zeroed or error-flagged frame
      * would display as a one-frame green flash.  Treat it as a dropped frame
