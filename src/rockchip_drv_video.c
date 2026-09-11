@@ -935,8 +935,10 @@ static void *rk_decode_thread(void *arg)
     return NULL;
 }
 
-/* Copy one access unit into the job ring for the worker.  Bounded wait for a
- * free slot; called from VA-API EndPicture. */
+/* Copy one access unit into the job ring for the worker.  Blocks (bounded
+ * only by context teardown) when the ring is full: natural backpressure —
+ * EndPicture must never fail "queue full" just because MPP is briefly busy,
+ * or ffmpeg aborts the stream on a spurious error. */
 static VAStatus rk_enqueue_job(RKContext *c, const uint8_t *data, size_t len,
                                VASurfaceID sid, int nosync)
 {
@@ -948,13 +950,11 @@ static VAStatus rk_enqueue_job(RKContext *c, const uint8_t *data, size_t len,
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 1000 * 1000;          /* 1ms */
         if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
-        if (pthread_cond_timedwait(&c->jq_not_full, &c->jq_mtx, &ts) == ETIMEDOUT)
-            break;
+        pthread_cond_timedwait(&c->jq_not_full, &c->jq_mtx, &ts);
     }
-    if (c->dec_stop || c->jq_n >= RK_JOB_CAP) {
+    if (c->dec_stop) {
         pthread_mutex_unlock(&c->jq_mtx);
-        LOG("enqueue: queue still full, dropping AU sid=0x%x", (unsigned)sid);
-        return VA_STATUS_ERROR_DECODING_ERROR;
+        return VA_STATUS_SUCCESS;           /* tearing down; drop silently */
     }
     void *copy = malloc(len);
     if (!copy) {
