@@ -165,7 +165,10 @@ static MppCodingType profile_to_coding(VAProfile p) {
     case VAProfileH264ConstrainedBaseline:
     case VAProfileH264Main:
     case VAProfileH264High:
-    case VAProfileH264High10:    return MPP_VIDEO_CodingAVC;
+#if VA_MINOR_VERSION >= 18
+    case VAProfileH264High10:
+#endif
+                                 return MPP_VIDEO_CodingAVC;
     case VAProfileHEVCMain:
     case VAProfileHEVCMain10:    return MPP_VIDEO_CodingHEVC;
     case VAProfileVP8Version0_3: return MPP_VIDEO_CodingVP8;
@@ -182,7 +185,9 @@ static int profile_idc(VAProfile p) {
     case VAProfileH264ConstrainedBaseline: return 66;
     case VAProfileH264Main:                return 77;
     case VAProfileH264High:                return 100;
+#if VA_MINOR_VERSION >= 18
     case VAProfileH264High10:              return 110;
+#endif
     default:                               return 100;
     }
 }
@@ -223,7 +228,9 @@ static VAStatus rk_QueryConfigProfiles(VADriverContextP ctx,
     list[i++] = VAProfileH264ConstrainedBaseline;
     list[i++] = VAProfileH264Main;
     list[i++] = VAProfileH264High;
+#if VA_MINOR_VERSION >= 18
     list[i++] = VAProfileH264High10;
+#endif
     list[i++] = VAProfileHEVCMain;
     list[i++] = VAProfileHEVCMain10;
     list[i++] = VAProfileVP8Version0_3;
@@ -260,6 +267,12 @@ static VAStatus rk_GetConfigAttributes(VADriverContextP ctx,
             break;
         case VAConfigAttribDecSliceMode:
             list[i].value = VA_DEC_SLICE_MODE_NORMAL;
+            break;
+        case VAConfigAttribMaxPictureWidth:
+            list[i].value = 8192;
+            break;
+        case VAConfigAttribMaxPictureHeight:
+            list[i].value = 8192;
             break;
         case VAConfigAttribEncryption:
             list[i].value = VA_ATTRIB_NOT_SUPPORTED;
@@ -318,10 +331,17 @@ static VAStatus rk_QueryConfigAttributes(VADriverContextP ctx,
     RKDriver *d = drv_from_ctx(ctx);
     RKConfig *c = config_by_id(d, id);
     if (!c) return VA_STATUS_ERROR_INVALID_CONFIG;
-    (void)attribs;
     *profile = c->profile;
     *entrypoint = c->entrypoint;
     *n = 0;
+    /* Chromium's FillProfileInfo (vaapi_wrapper.cc) considers a profile
+     * unusable unless vaQueryConfigAttributes returns a non-empty RTFormat,
+     * so report the formats this driver actually decodes into. */
+    if (attribs) {
+        attribs[0].type  = VAConfigAttribRTFormat;
+        attribs[0].value = VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
+        *n = 1;
+    }
     return VA_STATUS_SUCCESS;
 }
 
@@ -1372,7 +1392,7 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
         config, attrib_list ? "provided" : "NULL (query count)");
 
     /* Firefox calls this twice: first with NULL to get count, then with buffer */
-    const unsigned int n = 4;
+    const unsigned int n = 7;
     if (!attrib_list) {
         *num_attribs = n;
         return VA_STATUS_SUCCESS;
@@ -1402,14 +1422,29 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
     attrib_list[2].value.value.i     = (int)(VA_SURFACE_ATTRIB_MEM_TYPE_VA |
                                        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2);
 
-    /* Max resolution */
+    /* Max/min resolution */
     attrib_list[3].type              = VASurfaceAttribMaxWidth;
     attrib_list[3].flags             = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[3].value.type        = VAGenericValueTypeInteger;
     attrib_list[3].value.value.i     = 7680;
 
+    attrib_list[4].type              = VASurfaceAttribMaxHeight;
+    attrib_list[4].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[4].value.type        = VAGenericValueTypeInteger;
+    attrib_list[4].value.value.i     = 4320;
+
+    attrib_list[5].type              = VASurfaceAttribMinWidth;
+    attrib_list[5].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[5].value.type        = VAGenericValueTypeInteger;
+    attrib_list[5].value.value.i     = 16;
+
+    attrib_list[6].type              = VASurfaceAttribMinHeight;
+    attrib_list[6].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[6].value.type        = VAGenericValueTypeInteger;
+    attrib_list[6].value.value.i     = 16;
+
     *num_attribs = n;
-    LOG("QuerySurfaceAttributes: returned %u attribs (NV12, P010, DRM_PRIME_2)", n);
+    LOG("QuerySurfaceAttributes: returned %u attribs (NV12, P010, PRIME2, WxH)", n);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1575,3 +1610,9 @@ VAStatus __vaDriverInit_1_20(VADriverContextP ctx)  /* NOLINT */
     LOG("driver init OK — Rockchip RK3588 MPP");
     return VA_STATUS_SUCCESS;
 }
+
+/* Compatibility with older libva (e.g. libva 2.14 / VA-API 1.14 shipped in
+ * Debian 10-based UOS 20): libva only probes __vaDriverInit_<major>_<minor>
+ * down from its OWN minor version and never tries __vaDriverInit_1_20.
+ * Export a 1_14 alias of the same entry point so the driver loads there too. */
+VAStatus __vaDriverInit_1_14(VADriverContextP ctx) __attribute__((alias("__vaDriverInit_1_20")));
