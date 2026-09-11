@@ -860,32 +860,34 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     MppFrameFormat ffmt   = mpp_frame_get_fmt(frame);
 
     /* Detect MPP decode-failure frames (blank/zero content = one-frame green
-     * flash at 4K).  Sample the first rows of Y + MPP err/discard flags. */
+     * flash at 4K).  Sample a 3x3 grid of Y pixels (edges + center) so a
+     * genuine frame with ANY content is never misjudged (top-left corners are
+     * often letterbox-black). */
     RK_U32 errp = mpp_frame_get_errinfo(frame);
     RK_U32 disc = mpp_frame_get_discard(frame);
-    bool zeroish = false;
-    if (buf) {
+    bool blank = false;
+    if (buf && fwidth > 0 && fheight > 0) {
         const uint8_t *ypg = (const uint8_t *)mpp_buffer_get_ptr(buf);
         if (ypg) {
+            const int pr[3] = { 1, fheight / 2, fheight - 2 };
+            const int pc[3] = { 8, fwidth  / 2, fwidth  - 9 };
             RK_S64 acc = 0;
-            int rmax = (fheight > 0 && fheight < 4) ? fheight : 4;
-            int cmax = (fhs > 0 && fhs < 128) ? fhs : 128;
-            for (int r = 0; r < rmax; r++)
-                for (int c = 0; c < cmax; c++)
-                    acc += ypg[(size_t)r * (size_t)(fhs > 0 ? fhs : 1) + (size_t)c];
-            zeroish = (acc == 0);
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++)
+                    acc += ypg[(size_t)(pr[r] * (fhs > 0 ? fhs : fwidth)) + (size_t)pc[c]];
+            blank = (acc == 0);
         }
     }
-    LOG("assign: sid=0x%x err=%u disc=%u zeroish=%d",
-        (unsigned)sid, (unsigned)errp, (unsigned)disc, zeroish ? 1 : 0);
+    LOG("assign: sid=0x%x err=%u disc=%u blank=%d",
+        (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0);
 
     /* MPP decode-failure protection: a blank/zeroed or error-flagged frame
      * would display as a one-frame green flash.  Treat it as a dropped frame
      * and KEEP the previous content (or neutral gray) instead of copying
      * garbage. */
-    if (errp || zeroish) {
-        LOG("assign: sid=0x%x MPP blank/err frame dropped (err=%u disc=%u zeroish=%d)",
-            (unsigned)sid, (unsigned)errp, (unsigned)disc, zeroish ? 1 : 0);
+    if (errp || blank) {
+        LOG("assign: sid=0x%x MPP blank/err frame dropped (err=%u disc=%u blank=%d)",
+            (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0);
         pthread_mutex_lock(&s->lock);
         s->decoded = true;
         pthread_cond_signal(&s->cond);
