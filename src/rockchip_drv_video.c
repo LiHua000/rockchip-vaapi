@@ -142,6 +142,14 @@ typedef struct {
     int          hstride;
     int          vstride;
 
+    /* Zero-copy export (M3): the most recent decoded MppFrame is kept alive on
+     * the surface until the surface is reused (BeginPicture).  Its dma-buf fd
+     * is exported by vaExportSurfaceHandle with no per-frame memcpy; the
+     * buffer returns to MPP's pool on reuse (the consumer has presented the
+     * frame by then). */
+    MppFrame     last_frame;
+    int          export_fd;      /* dup'd dma-buf of last_frame, -1 if none */
+
     /* Dedicated per-surface DMA-BUF used as permanent output buffer.
      * Decoded pixels are copied here in assign_mpp_frame so MPP can
      * immediately reuse its internal 3-buffer pool, preventing the
@@ -263,6 +271,8 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
     for (int i = 0; i < MAX_SURFACES; i++) {
         if (!d->surfaces[i].used) continue;
         if (d->surfaces[i].frame) mpp_frame_deinit(&d->surfaces[i].frame);
+        if (d->surfaces[i].last_frame) mpp_frame_deinit(&d->surfaces[i].last_frame);
+        if (d->surfaces[i].export_fd >= 0) close(d->surfaces[i].export_fd);
         if (d->surfaces[i].prime_fd >= 0) close(d->surfaces[i].prime_fd);
         if (d->surfaces[i].priv_buf)   mpp_buffer_put(d->surfaces[i].priv_buf);
         if (d->surfaces[i].priv_group) mpp_buffer_group_put(d->surfaces[i].priv_group);
@@ -500,6 +510,8 @@ static VAStatus rk_DestroySurfaces(VADriverContextP ctx,
         RKSurface *s = surface_by_id(d, list[i]);
         if (!s) continue;
         if (s->frame)      mpp_frame_deinit(&s->frame);
+        if (s->last_frame) mpp_frame_deinit(&s->last_frame);
+        if (s->export_fd >= 0) close(s->export_fd);
         if (s->prime_fd >= 0) close(s->prime_fd);
         if (s->priv_buf)   { mpp_buffer_put(s->priv_buf);        s->priv_buf   = NULL; }
         if (s->priv_group) { mpp_buffer_group_put(s->priv_group); s->priv_group = NULL; }
@@ -602,7 +614,9 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         if (mpp_buffer_group_get_internal(&c->ext_group, MPP_BUFFER_TYPE_DRM) != MPP_OK)
             mpp_buffer_group_get_internal(&c->ext_group, MPP_BUFFER_TYPE_ION);
         if (c->ext_group) {
-            RK_S32 max_frames = 16;   /* mirrors rkmpp FRAMEGROUP_MAX_FRAMES */
+            /* Raise the pool so zero-copy pinning (last_frame kept until the
+             * surface is reused) + MPP's DPB coexist. */
+            RK_S32 max_frames = 48;
             mpp_buffer_group_limit_config(c->ext_group, 0, max_frames);
             c->mpi->control(c->mpp, MPP_DEC_SET_EXT_BUF_GROUP, (MppParam)c->ext_group);
             LOG("CreateContext: EXT_BUF_GROUP allocated (%p)", (void *)c->ext_group);
@@ -745,11 +759,14 @@ static VAStatus rk_BeginPicture(VADriverContextP ctx,
 
     /* Reset surface state for this decode cycle.  priv_buf/prime_fd are kept
      * intact so ExportSurfaceHandle always returns a valid fd (the previous
-     * decoded frame or the initial placeholder). assign_mpp_frame copies the
-     * new decoded pixels into priv_buf without touching prime_fd. */
+     * decoded frame or the initial placeholder).  The zero-copy pin (last_frame)
+     * is released here — the consumer has presented the previous frame before
+     * reusing this surface, so its buffer can return to MPP's pool. */
     RKSurface *s = surface_by_id(d, render_target);
     if (s) {
         pthread_mutex_lock(&s->lock);
+        if (s->last_frame) { mpp_frame_deinit(&s->last_frame); s->last_frame = NULL; }
+        if (s->export_fd >= 0) { close(s->export_fd); s->export_fd = -1; }
         s->decoded = false;
         s->ctx_id  = ctx_id;
         pthread_mutex_unlock(&s->lock);
@@ -838,30 +855,45 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     bool i10    = MPP_FRAME_FMT_IS_YUV_10BIT(ffmt);
     int  bpp    = i10 ? 2 : 1;
     int  copied = 0;
-    void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
-    void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
-    /* RK_VAAPI_NOCOPY=1 skips the per-frame 12MB DPB->priv_buf copy
-     * (benchmark only; display content would alias). */
-    static int n_copy = -1;
-    if (n_copy < 0) n_copy = getenv("RK_VAAPI_NOCOPY") ? 1 : 0;
-    if (src && dst && !n_copy) {
-        const uint8_t *sy = (const uint8_t *)src;
-        uint8_t       *dy = (uint8_t       *)dst;
-        for (int r = 0; r < copy_h; r++)
-            memcpy(dy + (size_t)r * src_hs * bpp,
-                   sy + (size_t)r * src_hs * bpp,
-                   (size_t)src_hs * bpp);
-        const uint8_t *su = sy + (size_t)src_hs * src_vs * bpp;
-        uint8_t       *du = dy + (size_t)src_hs * src_vs * bpp;
-        for (int r = 0; r < copy_h / 2; r++)
-            memcpy(du + (size_t)r * src_hs * bpp,
-                   su + (size_t)r * src_hs * bpp,
-                   (size_t)src_hs * bpp);
-        copied = 1;
-    }
-    mpp_frame_deinit(&frame);
 
+    /* M3 zero-copy: keep the decoded MppFrame alive on the surface and
+     * export its dma-buf directly (no per-frame 12MB DPB->priv_buf copy —
+     * that copy cost ~14fps at 4K in mpv).  RK_VAAPI_KEEPCOPY=1 restores the
+     * old copy path (browser/Firefox-safe, aliasing-free placeholder). */
+    static int keep_copy = -1;
+    if (keep_copy < 0) keep_copy = getenv("RK_VAAPI_KEEPCOPY") ? 1 : 0;
+
+    if (keep_copy) {
+        void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
+        void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
+        if (src && dst) {
+            const uint8_t *sy = (const uint8_t *)src;
+            uint8_t       *dy = (uint8_t       *)dst;
+            for (int r = 0; r < copy_h; r++)
+                memcpy(dy + (size_t)r * src_hs * bpp,
+                       sy + (size_t)r * src_hs * bpp,
+                       (size_t)src_hs * bpp);
+            const uint8_t *su = sy + (size_t)src_hs * src_vs * bpp;
+            uint8_t       *du = dy + (size_t)src_hs * src_vs * bpp;
+            for (int r = 0; r < copy_h / 2; r++)
+                memcpy(du + (size_t)r * src_hs * bpp,
+                       su + (size_t)r * src_hs * bpp,
+                       (size_t)src_hs * bpp);
+            copied = 1;
+        }
+    }
+
+    /* Replace the previously pinned frame (buffer returns to MPP pool). */
     pthread_mutex_lock(&s->lock);
+    if (s->last_frame) { mpp_frame_deinit(&s->last_frame); s->last_frame = NULL; }
+    if (s->export_fd >= 0) { close(s->export_fd); s->export_fd = -1; }
+    if (!keep_copy) {
+        s->last_frame = frame;      /* keep; deinit on surface reuse */
+        int mfd = buf ? mpp_buffer_get_fd(buf) : -1;
+        if (mfd >= 0) s->export_fd = dup(mfd);
+    } else {
+        mpp_frame_deinit(&frame);   /* pixels already copied to priv_buf */
+    }
     s->frame  = NULL;
     s->fmt    = ffmt;
     if (fwidth  > 0) s->width   = fwidth;
@@ -874,8 +906,8 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     /* touch these outside the lock; only the worker thread writes them */
     c->frames_out++;
     clock_gettime(CLOCK_MONOTONIC, &c->last_out_ts);
-    LOG("assign_mpp_frame: surface=0x%x prime_fd=%d MPP %dx%d stride=%dx%d fmt=0x%x copied=%d",
-        (unsigned)sid, s->prime_fd, fwidth, fheight, fhs, fvs, (unsigned)ffmt, copied);
+    LOG("assign_mpp_frame: surface=0x%x prime_fd=%d export_fd=%d MPP %dx%d stride=%dx%d fmt=0x%x copied=%d",
+        (unsigned)sid, s->prime_fd, s->export_fd, fwidth, fheight, fhs, fvs, (unsigned)ffmt, copied);
 }
 
 /* ── decode worker (single-threaded MPP consumer) ──────────────── */
@@ -1310,7 +1342,7 @@ static VAStatus rk_ExportSurfaceHandle(VADriverContextP ctx,
         rk_SyncSurface(ctx, id);
 
     pthread_mutex_lock(&s->lock);
-    int fd       = s->prime_fd;
+    int fd       = (s->export_fd >= 0) ? s->export_fd : s->prime_fd;
     int hs       = s->hstride ? s->hstride : s->width;
     int vs       = s->vstride ? s->vstride : s->height;
     bool decoded = s->decoded;
@@ -1509,11 +1541,10 @@ static VAStatus rk_GetImage(VADriverContextP ctx, VASurfaceID surface_id,
     RKDriver  *d  = drv_from_ctx(ctx);
     RKSurface *s  = surface_by_id(d, surface_id);
     RKBuffer  *ib = buffer_by_id(d, (VABufferID)image_id);
-    if (!s || !ib || !s->priv_buf || !ib->data) {
-        LOG("GetImage: surface=0x%x img=0x%x FAIL s=%d ib=%d priv_buf=%d data=%d",
+    if (!s || !ib || !ib->data) {
+        LOG("GetImage: surface=0x%x img=0x%x FAIL s=%d ib=%d data=%d",
             (unsigned)surface_id, (unsigned)image_id,
-            s ? 1 : 0, ib ? 1 : 0,
-            (s && s->priv_buf) ? 1 : 0, (ib && ib->data) ? 1 : 0);
+            s ? 1 : 0, ib ? 1 : 0, (ib && ib->data) ? 1 : 0);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
@@ -1521,19 +1552,29 @@ static VAStatus rk_GetImage(VADriverContextP ctx, VASurfaceID surface_id,
     int vs  = s->vstride ? s->vstride : s->height;
     bool i10 = MPP_FRAME_FMT_IS_YUV_10BIT(s->fmt);
     int bpp  = i10 ? 2 : 1;
-    /* image stride matches rk_CreateImage: (width+15)&~15 */
     int img_hs = (int)(((unsigned int)s->width + 15u) & ~15u) * bpp;
 
-    const uint8_t *sp = (const uint8_t *)mpp_buffer_get_ptr(s->priv_buf);
-    uint8_t       *dp = (uint8_t *)ib->data;
-    /* Y plane */
+    /* Under s->lock the pinned last_frame can't be deinit'd mid-read. */
+    pthread_mutex_lock(&s->lock);
+    const uint8_t *sp = NULL;
+    if (s->last_frame) {
+        MppBuffer lb = mpp_frame_get_buffer(s->last_frame);
+        if (lb) sp = (const uint8_t *)mpp_buffer_get_ptr(lb);
+    }
+    if (!sp && s->priv_buf)
+        sp = (const uint8_t *)mpp_buffer_get_ptr(s->priv_buf);
+    if (!sp) {
+        pthread_mutex_unlock(&s->lock);
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+    uint8_t *dp = (uint8_t *)ib->data;
     for (int r = 0; r < s->height; r++)
         memcpy(dp + r * img_hs, sp + r * hs * bpp, (size_t)img_hs);
-    /* UV plane: src at hs*vs, dst at img_hs*height */
     const uint8_t *su = sp + (size_t)hs * vs * bpp;
     uint8_t       *du = dp + (size_t)img_hs * s->height;
     for (int r = 0; r < s->height / 2; r++)
         memcpy(du + r * img_hs, su + r * hs * bpp, (size_t)img_hs);
+    pthread_mutex_unlock(&s->lock);
     return VA_STATUS_SUCCESS;
 }
 
