@@ -549,6 +549,13 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         c->mpi->control(c->mpp, MPP_DEC_SET_CFG, dec_cfg);
         mpp_dec_cfg_deinit(dec_cfg);
 
+        /* Emit frames as soon as they are decoded (rkmpp option).  Without it
+         * MPP holds finished pictures in its reorder buffer waiting for more
+         * input; a VA-API consumer that syncs one surface right after each
+         * EndPicture then waits out the 3s timeout at the end of a clip. */
+        MppParam imm_out = (MppParam)(intptr_t)1;
+        c->mpi->control(c->mpp, MPP_DEC_SET_IMMEDIATE_OUT, (MppParam)&imm_out);
+
         int block = 0;
         c->mpi->control(c->mpp, MPP_SET_OUTPUT_BLOCK, (MppParam)&block);
 
