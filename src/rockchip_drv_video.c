@@ -1367,6 +1367,9 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
      * here.  Timeout is generous (1s); a genuine MPP ocasional drop at 4K is
      * resolved by the worker instantly (awaited ring), so a long wait here
      * means either MPP is briefly slow or this surface's AU was dropped. */
+    struct timespec ts_start;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_nsec += 1 * 1000 * 1000 * 1000;
@@ -1397,6 +1400,14 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
         done = s->decoded;
     }
     pthread_mutex_unlock(&s->lock);
+
+    struct timespec ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    long wait_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000L +
+                   (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000L;
+    if (wait_ms > 2)
+        LOG("SyncSurface: WAITED=%ld ms surface=0x%x %s",
+            wait_ms, id, done ? "OK" : "TIMEOUT");
 
     LOG("SyncSurface: surface=0x%x %s prime_fd=%d",
         id, done ? "OK" : "TIMEOUT", s->prime_fd);
