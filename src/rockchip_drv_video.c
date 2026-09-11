@@ -1167,10 +1167,17 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
 
     /* Wait for the decode worker to deliver this surface's frame.  The worker
      * is the only thread that calls decode_get_frame, so no active draining
-     * here (that shared get was what stalled the pipeline before). */
+     * here (that shared get was what stalled the pipeline before).
+     *
+     * Timeout is short (350ms): MPP hands a decoded frame back in tens of
+     * milliseconds, so a wait this long with no frame means the AU was
+     * dropped by the hardware decoder (a known thing at 4K).  The fallback
+     * below then keeps the previous content instead of stalling the stream
+     * for 3s or aborting it. */
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 3;
+    deadline.tv_nsec += 350 * 1000 * 1000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec += 1; deadline.tv_nsec -= 1000000000; }
 
     pthread_mutex_lock(&s->lock);
     int done = s->decoded;
