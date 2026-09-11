@@ -141,6 +141,7 @@ typedef struct {
     int          prime_fd;       /* dup'd fd to priv_buf, stable for surface lifetime */
     int          hstride;
     int          vstride;
+    bool         priv_filled;    /* priv_buf/last_frame ever held a decoded frame */
 
     /* Zero-copy export (M3): the most recent decoded MppFrame is kept alive on
      * the surface until the surface is reused (BeginPicture).  Its dma-buf fd
@@ -477,6 +478,14 @@ static VAStatus rk_CreateSurfaces(VADriverContextP ctx,
                 int raw_fd = mpp_buffer_get_fd(buf);
                 int dup_fd = (raw_fd > 0) ? dup(raw_fd) : -1;
                 if (dup_fd > 0) {
+                    /* Neutral placeholder (gray NV12, NOT zeroed = green) so
+                     * any pre-decode/stale export never shows a green frame. */
+                    uint8_t *ph = (uint8_t *)mpp_buffer_get_ptr(buf);
+                    if (ph) {
+                        memset(ph, 80, (size_t)hs * vs);
+                        memset(ph + (size_t)hs * vs, 128,
+                               (size_t)hs * vs * 3 - (size_t)hs * vs);
+                    }
                     surf->priv_group = grp;
                     surf->priv_buf   = buf;
                     surf->prime_fd   = dup_fd;
@@ -907,6 +916,7 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     }
     s->frame  = NULL;
     s->fmt    = ffmt;
+    s->priv_filled = true;   /* this surface now holds a real decoded frame */
     if (fwidth  > 0) s->width   = fwidth;
     if (fheight > 0) s->height  = fheight;
     if (fhs     > 0) s->hstride = fhs;
@@ -1266,16 +1276,12 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
 
     /* Wait for the decode worker to deliver this surface's frame.  The worker
      * is the only thread that calls decode_get_frame, so no active draining
-     * here (that shared get was what stalled the pipeline before).
-     *
-     * Timeout is short (350ms): MPP hands a decoded frame back in tens of
-     * milliseconds, so a wait this long with no frame means the AU was
-     * dropped by the hardware decoder (a known thing at 4K).  The fallback
-     * below then keeps the previous content instead of stalling the stream
-     * for 3s or aborting it. */
+     * here.  Timeout is generous (1s); a genuine MPP ocasional drop at 4K is
+     * resolved by the worker instantly (awaited ring), so a long wait here
+     * means either MPP is briefly slow or this surface's AU was dropped. */
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_nsec += 350 * 1000 * 1000;
+    deadline.tv_nsec += 1 * 1000 * 1000 * 1000;
     if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec += 1; deadline.tv_nsec -= 1000000000; }
 
     pthread_mutex_lock(&s->lock);
@@ -1283,17 +1289,20 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
     while (!done) {
         int rc = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
         if (rc == ETIMEDOUT) {
-            /* One surface that MPP never delivered while the decoder is
-             * otherwise alive = an occasional hardware frame drop (common at
-             * 4K).  Keep the previous placeholder content and continue; only
-             * a decoder that never produced ANY frame is an error. */
+            /* A frame that never arrived while the decoder is otherwise alive
+             * is a hardware drop — but ONLY treat it as a dropped (stale)
+             * frame if this surface already holds real pixels.  A surface
+             * that was never filled must NOT be handed out (its placeholder
+             * is neutral gray, but a "success" would still be a wrong frame);
+             * report a real error there. */
             RKContext *cc = s->ctx_id ? context_by_id(d, s->ctx_id) : NULL;
-            if (cc && cc->frames_out > 0) {
-                LOG("SyncSurface: DROPPED surface=0x%x (stale content, frames=%lld)",
+            if (cc && cc->frames_out > 0 && s->priv_filled) {
+                LOG("SyncSurface: DROPPED surface=0x%x (stale, frames=%lld)",
                     id, (long long)cc->frames_out);
                 done = 1;
             } else {
-                LOG("SyncSurface: TIMEOUT surface=0x%x prime_fd=%d", id, s->prime_fd);
+                LOG("SyncSurface: TIMEOUT surface=0x%x prime_fd=%d filled=%d",
+                    id, s->prime_fd, s->priv_filled ? 1 : 0);
             }
             break;
         }
@@ -1349,8 +1358,13 @@ static VAStatus rk_ExportSurfaceHandle(VADriverContextP ctx,
     pthread_mutex_lock(&s->lock);
     bool needs_sync = !s->decoded && (s->ctx_id != 0);
     pthread_mutex_unlock(&s->lock);
-    if (needs_sync)
-        rk_SyncSurface(ctx, id);
+    if (needs_sync) {
+        VAStatus st = rk_SyncSurface(ctx, id);
+        if (st != VA_STATUS_SUCCESS) {
+            LOG("ExportSurfaceHandle: front-sync failed gr=%d, abort export", (int)st);
+            return st;
+        }
+    }
 
     pthread_mutex_lock(&s->lock);
     int fd       = (s->export_fd > 0) ? s->export_fd : s->prime_fd;
