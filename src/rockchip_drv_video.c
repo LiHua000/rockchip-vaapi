@@ -867,19 +867,32 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     RK_U32 disc = mpp_frame_get_discard(frame);
     bool blank = false;
     if (buf && fwidth > 0 && fheight > 0) {
-        const uint8_t *ypg = (const uint8_t *)mpp_buffer_get_ptr(buf);
-        if (ypg) {
+        const uint8_t *pg = (const uint8_t *)mpp_buffer_get_ptr(buf);
+        if (pg) {
+            /* Y grid */
             const int pr[3] = { 1, fheight / 2, fheight - 2 };
             const int pc[3] = { 8, fwidth  / 2, fwidth  - 9 };
-            RK_S64 acc = 0;
+            RK_S64 yy = 0;
             for (int r = 0; r < 3; r++)
                 for (int c = 0; c < 3; c++)
-                    acc += ypg[(size_t)(pr[r] * (fhs > 0 ? fhs : fwidth)) + (size_t)pc[c]];
-            blank = (acc == 0);
+                    yy += pg[(size_t)(pr[r] * (fhs > 0 ? fhs : fwidth)) + (size_t)pc[c]];
+            /* NV12 UV plane grid: UV starts at fhs*fvs; row stride = fhs,
+             * two chroma bytes per pixel.  All-zero UV (missing chroma)
+             * decodes to pure green, so it must also count as "blank". */
+            RK_S64 uu = 0;
+            size_t uvoff = (size_t)(fhs > 0 ? fhs : fwidth) * (size_t)(fvs > 0 ? fvs : fheight);
+            const int upr[3] = { fheight / 4, fheight / 2, 3 * fheight / 4 };
+            const int upc[3] = { 8, fwidth / 2, fwidth - 9 };
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) {
+                    size_t r0 = (size_t)(upr[r] / 2);
+                    uu += pg[uvoff + r0 * (size_t)(fhs) + (size_t)(upc[c] & ~1u)];
+                }
+            blank = (yy == 0) || (uu == 0);
         }
     }
-    LOG("assign: sid=0x%x err=%u disc=%u blank=%d",
-        (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0);
+    LOG("assign: sid=0x%x err=%u disc=%u blank=%d %s",
+        (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0, blank ? "(Y/UV zero)" : "");
 
     /* MPP decode-failure protection: a blank/zeroed or error-flagged frame
      * would display as a one-frame green flash.  Treat it as a dropped frame
