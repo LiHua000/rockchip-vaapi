@@ -272,7 +272,7 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
         if (!d->surfaces[i].used) continue;
         if (d->surfaces[i].frame) mpp_frame_deinit(&d->surfaces[i].frame);
         if (d->surfaces[i].last_frame) mpp_frame_deinit(&d->surfaces[i].last_frame);
-        if (d->surfaces[i].export_fd >= 0) close(d->surfaces[i].export_fd);
+        if (d->surfaces[i].export_fd > 0) close(d->surfaces[i].export_fd);
         if (d->surfaces[i].prime_fd >= 0) close(d->surfaces[i].prime_fd);
         if (d->surfaces[i].priv_buf)   mpp_buffer_put(d->surfaces[i].priv_buf);
         if (d->surfaces[i].priv_group) mpp_buffer_group_put(d->surfaces[i].priv_group);
@@ -458,10 +458,12 @@ static VAStatus rk_CreateSurfaces(VADriverContextP ctx,
         }
         RKSurface *surf = &d->surfaces[i];
         memset(surf, 0, sizeof(*surf));
-        surf->used     = true;
-        surf->width    = width;
-        surf->height   = height;
-        surf->prime_fd = -1;
+        surf->used       = true;
+        surf->width      = width;
+        surf->height     = height;
+        surf->prime_fd   = -1;
+        surf->export_fd  = -1;   /* fd 0 is a valid-return but we treat <=0 as "none" */
+        surf->last_frame = NULL;
 
         /* Pre-allocate placeholder DMA-BUF so ExportSurfaceHandle succeeds
          * before any decode (e.g. Firefox's DMABUF capability probe). */
@@ -511,7 +513,7 @@ static VAStatus rk_DestroySurfaces(VADriverContextP ctx,
         if (!s) continue;
         if (s->frame)      mpp_frame_deinit(&s->frame);
         if (s->last_frame) mpp_frame_deinit(&s->last_frame);
-        if (s->export_fd >= 0) close(s->export_fd);
+        if (s->export_fd > 0) close(s->export_fd);
         if (s->prime_fd >= 0) close(s->prime_fd);
         if (s->priv_buf)   { mpp_buffer_put(s->priv_buf);        s->priv_buf   = NULL; }
         if (s->priv_group) { mpp_buffer_group_put(s->priv_group); s->priv_group = NULL; }
@@ -766,7 +768,7 @@ static VAStatus rk_BeginPicture(VADriverContextP ctx,
     if (s) {
         pthread_mutex_lock(&s->lock);
         if (s->last_frame) { mpp_frame_deinit(&s->last_frame); s->last_frame = NULL; }
-        if (s->export_fd >= 0) { close(s->export_fd); s->export_fd = -1; }
+        if (s->export_fd > 0) { close(s->export_fd); s->export_fd = -1; }
         s->decoded = false;
         s->ctx_id  = ctx_id;
         pthread_mutex_unlock(&s->lock);
@@ -886,11 +888,16 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     /* Replace the previously pinned frame (buffer returns to MPP pool). */
     pthread_mutex_lock(&s->lock);
     if (s->last_frame) { mpp_frame_deinit(&s->last_frame); s->last_frame = NULL; }
-    if (s->export_fd >= 0) { close(s->export_fd); s->export_fd = -1; }
+    if (s->export_fd > 0) { close(s->export_fd); s->export_fd = -1; }
     if (!keep_copy) {
         s->last_frame = frame;      /* keep; deinit on surface reuse */
         int mfd = buf ? mpp_buffer_get_fd(buf) : -1;
-        if (mfd >= 0) s->export_fd = dup(mfd);
+        if (mfd > 0) {
+            int dfd = dup(mfd);
+            s->export_fd = (dfd > 0) ? dfd : -1;
+        } else {
+            s->export_fd = -1;
+        }
     } else {
         mpp_frame_deinit(&frame);   /* pixels already copied to priv_buf */
     }
@@ -1342,7 +1349,7 @@ static VAStatus rk_ExportSurfaceHandle(VADriverContextP ctx,
         rk_SyncSurface(ctx, id);
 
     pthread_mutex_lock(&s->lock);
-    int fd       = (s->export_fd >= 0) ? s->export_fd : s->prime_fd;
+    int fd       = (s->export_fd > 0) ? s->export_fd : s->prime_fd;
     int hs       = s->hstride ? s->hstride : s->width;
     int vs       = s->vstride ? s->vstride : s->height;
     bool decoded = s->decoded;
@@ -1350,8 +1357,8 @@ static VAStatus rk_ExportSurfaceHandle(VADriverContextP ctx,
     bool is_10bit = MPP_FRAME_FMT_IS_YUV_10BIT(s->fmt);
     pthread_mutex_unlock(&s->lock);
 
-    if (fd < 0) {
-        LOG("ExportSurfaceHandle: prime_fd not ready (fd<0 decoded=%d), ERROR_INVALID_SURFACE", decoded);
+    if (fd <= 0) {
+        LOG("ExportSurfaceHandle: no fd (fd=%d decoded=%d), ERROR_INVALID_SURFACE", fd, decoded);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
