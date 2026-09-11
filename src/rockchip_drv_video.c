@@ -858,12 +858,16 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     int  bpp    = i10 ? 2 : 1;
     int  copied = 0;
 
-    /* M3 zero-copy: keep the decoded MppFrame alive on the surface and
-     * export its dma-buf directly (no per-frame 12MB DPB->priv_buf copy —
-     * that copy cost ~14fps at 4K in mpv).  RK_VAAPI_KEEPCOPY=1 restores the
-     * old copy path (browser/Firefox-safe, aliasing-free placeholder). */
+    /* Default = DPB->priv_buf copy path (aliasing-free, stable per-surface
+     * buffer => no tearing for consumers that hold textures across reuse,
+     * e.g. mpv).  RK_VAAPI_ZEROCOPY=1 switches to the M3 zero-copy export
+     * (pin last MppFrame + export its dma-buf) for benchmarking — faster
+     * but MPP may recycle the buffer while GL is still drawing it. */
     static int keep_copy = -1;
-    if (keep_copy < 0) keep_copy = getenv("RK_VAAPI_KEEPCOPY") ? 1 : 0;
+    if (keep_copy < 0) {
+        const char *zc = getenv("RK_VAAPI_ZEROCOPY");
+        keep_copy = (zc && zc[0] == '1') ? 0 : 1;
+    }
 
     if (keep_copy) {
         void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
