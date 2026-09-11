@@ -244,7 +244,10 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
     }
     for (int i = 0; i < MAX_CONTEXTS; i++) {
         if (!d->contexts[i].used) continue;
-        if (d->contexts[i].mpp) mpp_destroy(d->contexts[i].mpp);
+        if (d->contexts[i].mpp) {
+            d->contexts[i].mpi->reset(d->contexts[i].mpp);
+            mpp_destroy(d->contexts[i].mpp);
+        }
         pthread_mutex_destroy(&d->contexts[i].jq_mtx);
         pthread_cond_destroy(&d->contexts[i].jq_not_empty);
         pthread_cond_destroy(&d->contexts[i].jq_not_full);
@@ -541,6 +544,11 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         int block = 0;
         c->mpi->control(c->mpp, MPP_SET_OUTPUT_BLOCK, (MppParam)&block);
 
+        /* Non-blocking input so the worker never blocks inside MPP when we
+         * ask it to stop (decode_put_packet may return MPP_ERR_BUFFER_FULL,
+         * which the worker retries after draining). */
+        c->mpi->control(c->mpp, MPP_SET_INPUT_BLOCK, (MppParam)&block);
+
         /* decode worker pump */
         c->dec_d   = d;
         c->jq_head = c->jq_tail = c->jq_n = 0;
@@ -578,7 +586,14 @@ static VAStatus rk_DestroyContext(VADriverContextP ctx, VAContextID id) {
     RKContext *c = context_by_id(d, id);
     if (!c) return VA_STATUS_ERROR_INVALID_CONTEXT;
     rk_ctx_stop_worker(c);
-    if (c->mpp) mpp_destroy(c->mpp);
+    /* Flush the decoder before destroying it (mirrors ffmpeg rkmppdec:
+     * mpi->reset() waits for in-flight hardware tasks / frees the DPB so
+     * mpp_destroy() does not race a still-running decode task and crash
+     * inside MPP's deinit with a NULL mutex). */
+    if (c->mpp) {
+        c->mpi->reset(c->mpp);
+        mpp_destroy(c->mpp);
+    }
     pthread_mutex_destroy(&c->jq_mtx);
     pthread_cond_destroy(&c->jq_not_empty);
     pthread_cond_destroy(&c->jq_not_full);
