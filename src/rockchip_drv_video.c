@@ -1393,7 +1393,10 @@ static VAStatus rk_CreateImage(VADriverContextP ctx,
     unsigned int size   = stride * (unsigned int)height * 3 / 2;
     VAStatus st = rk_CreateBuffer(ctx, 0, VAImageBufferType, size, 1,
                                   NULL, &buf_id);
-    if (st != VA_STATUS_SUCCESS) return st;
+    if (st != VA_STATUS_SUCCESS) {
+        LOG("CreateImage: buffer alloc FAILED size=%u st=%d", size, (int)st);
+        return st;
+    }
 
     memset(image, 0, sizeof(*image));
     image->image_id    = buf_id; /* reuse buf_id as image_id for simplicity */
@@ -1450,7 +1453,13 @@ static VAStatus rk_GetImage(VADriverContextP ctx, VASurfaceID surface_id,
     RKDriver  *d  = drv_from_ctx(ctx);
     RKSurface *s  = surface_by_id(d, surface_id);
     RKBuffer  *ib = buffer_by_id(d, (VABufferID)image_id);
-    if (!s || !ib || !s->priv_buf || !ib->data) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!s || !ib || !s->priv_buf || !ib->data) {
+        LOG("GetImage: surface=0x%x img=0x%x FAIL s=%d ib=%d priv_buf=%d data=%d",
+            (unsigned)surface_id, (unsigned)image_id,
+            s ? 1 : 0, ib ? 1 : 0,
+            (s && s->priv_buf) ? 1 : 0, (ib && ib->data) ? 1 : 0);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
 
     int hs  = s->hstride ? s->hstride : s->width;
     int vs  = s->vstride ? s->vstride : s->height;
