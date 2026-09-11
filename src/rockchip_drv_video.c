@@ -113,6 +113,14 @@ typedef struct {
     volatile int      dec_stop;
     void             *dec_d;          /* RKDriver * (forward type) */
 
+    /* Surface IDs handed to MPP, in submission (decode) order.  MPP emits
+     * output frames in the same order, so when a frame for sid X arrives,
+     * every queued entry before X that never arrived was dropped by the
+     * hardware — resolve those surfaces instantly (keep previous content)
+     * instead of letting SyncSurface sit out its 350ms timeout per drop. */
+    VASurfaceID       awaited[64];
+    int               awa_head, awa_tail;
+
     /* H.264 state for SPS/PPS reconstruction */
     VAPictureParameterBufferH264 last_pp;
     bool         sps_sent;
@@ -792,6 +800,25 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
         return;
     }
 
+    /* MPP emits frames in submission (decode) order.  A frame arriving for
+     * sid proves every older awaited sid that never came was dropped by the
+     * hardware — resolve those surfaces right now (keep the previous content)
+     * so VA-API SyncSurface does not sit out a 350ms timeout per dropped
+     * frame (the visible micro-stutter at 4K). */
+    while (c->awa_head != c->awa_tail) {
+        VASurfaceID p = c->awaited[c->awa_head % 64];
+        c->awa_head++;
+        if (p == sid) break;
+        RKSurface *sp = surface_by_id(d, p);
+        if (sp) {
+            pthread_mutex_lock(&sp->lock);
+            sp->decoded = true;
+            pthread_cond_signal(&sp->cond);
+            pthread_mutex_unlock(&sp->lock);
+            LOG("worker: DROPPED_R=0x%x stale (next ok 0x%x)", (unsigned)p, (unsigned)sid);
+        }
+    }
+
     MppBuffer      buf    = mpp_frame_get_buffer(frame);
     int            fwidth = (int)mpp_frame_get_width(frame);
     int            fheight= (int)mpp_frame_get_height(frame);
@@ -943,11 +970,11 @@ static void *rk_decode_thread(void *arg)
                 if (ret != MPP_OK)
                     LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
                         (int)ret, job.len, (unsigned)job.sid);
-                else if (ret != MPP_OK)
-                    LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
-                        (int)ret, job.len, (unsigned)job.sid);
-                else
+                else {
+                    c->awaited[c->awa_tail % 64] = job.sid;
+                    c->awa_tail++;
                     LOG("decode worker: put len=%zu sid=0x%x", job.len, (unsigned)job.sid);
+                }
             }
         }
         free(job.data);

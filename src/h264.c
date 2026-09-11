@@ -63,7 +63,11 @@ int h264_write_sps(uint8_t *buf, size_t buf_size,
     bs_write(&bs, 0, 1); /* constraint_set2 */
     bs_write(&bs, 0, 5); /* constraint_set3..5 (3) + reserved_zero_2bits (2) */
 
-    bs_write(&bs, 51, 8); /* level_idc = 5.1 (safe for all content) */
+    /* level_idc: 6.0 (60). The upstream 5.1 is below what 4K@60 requires
+     * (3840×2160×60 > level 5.1 MaxMBPS), and a too-low level can make MPP
+     * periodically reject/reset high-load pictures. MPP mostly uses this for
+     * capability checks, so a safe upper bound is fine for decode. */
+    bs_write(&bs, 60, 8); /* level_idc = 6.0 */
 
     bs_write_ue(&bs, 0); /* seq_parameter_set_id */
 
