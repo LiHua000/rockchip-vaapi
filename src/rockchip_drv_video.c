@@ -583,6 +583,11 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         MppParam imm_out = (MppParam)(intptr_t)1;
         c->mpi->control(c->mpp, MPP_DEC_SET_IMMEDIATE_OUT, (MppParam)&imm_out);
 
+        /* rkmpp parity knobs (harmless with the async worker; earlier they
+         * were measured on the broken 1-2fps engine and moved nothing). */
+        c->mpi->control(c->mpp, MPP_DEC_SET_PARSER_FAST_MODE, (MppParam)&imm_out);
+        c->mpi->control(c->mpp, MPP_DEC_SET_DISABLE_ERROR,   (MppParam)&imm_out);
+
         int block = 0;
         c->mpi->control(c->mpp, MPP_SET_OUTPUT_BLOCK, (MppParam)&block);
 
@@ -835,7 +840,11 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     int  copied = 0;
     void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
     void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
-    if (src && dst) {
+    /* RK_VAAPI_NOCOPY=1 skips the per-frame 12MB DPB->priv_buf copy
+     * (benchmark only; display content would alias). */
+    static int n_copy = -1;
+    if (n_copy < 0) n_copy = getenv("RK_VAAPI_NOCOPY") ? 1 : 0;
+    if (src && dst && !n_copy) {
         const uint8_t *sy = (const uint8_t *)src;
         uint8_t       *dy = (uint8_t       *)dst;
         for (int r = 0; r < copy_h; r++)
