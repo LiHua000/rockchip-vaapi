@@ -891,8 +891,9 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
             blank = (mn == 0 && mx == 0) || (var < 4.0) || (uu == 0);
         }
     }
-    LOG("assign: sid=0x%x err=%u disc=%u blank=%d",
-        (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0);
+    if (blank || errp)
+        LOG("assign: sid=0x%x err=%u disc=%u blank=%d",
+            (unsigned)sid, (unsigned)errp, (unsigned)disc, blank ? 1 : 0);
 
     /* MPP decode-failure protection: a blank/zeroed or error-flagged frame
      * would display as a one-frame green flash.  Treat it as a dropped frame
