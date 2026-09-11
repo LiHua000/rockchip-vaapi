@@ -116,6 +116,12 @@ typedef struct {
     /* H.264 state for SPS/PPS reconstruction */
     VAPictureParameterBufferH264 last_pp;
     bool         sps_sent;
+
+    /* decode health: frames actually delivered and when the last one was,
+     * used to distinguish an occasional MPP frame drop (tolerate, keep the
+     * previous content) from a fully stalled decoder (report an error). */
+    RK_S64        frames_out;
+    struct timespec last_out_ts;
 } RKContext;
 
 typedef struct {
@@ -809,6 +815,9 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     s->decoded  = true;
     pthread_cond_signal(&s->cond);
     pthread_mutex_unlock(&s->lock);
+    /* touch these outside the lock; only the worker thread writes them */
+    c->frames_out++;
+    clock_gettime(CLOCK_MONOTONIC, &c->last_out_ts);
     LOG("assign_mpp_frame: surface=0x%x prime_fd=%d MPP %dx%d stride=%dx%d fmt=0x%x copied=%d",
         (unsigned)sid, s->prime_fd, fwidth, fheight, fhs, fvs, (unsigned)ffmt, copied);
 }
@@ -912,6 +921,9 @@ static void *rk_decode_thread(void *arg)
             }
             if (!c->dec_stop) {
                 if (ret != MPP_OK)
+                    LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
+                        (int)ret, job.len, (unsigned)job.sid);
+                else if (ret != MPP_OK)
                     LOG("decode worker: put_packet ret=%d len=%zu sid=0x%x",
                         (int)ret, job.len, (unsigned)job.sid);
                 else
@@ -1165,7 +1177,22 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
     while (!done) {
         int rc = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
         if (rc == ETIMEDOUT) {
-            LOG("SyncSurface: TIMEOUT surface=0x%x prime_fd=%d", id, s->prime_fd);
+            /* One surface that MPP never delivered while the decoder is
+             * otherwise alive = an occasional hardware frame drop (common at
+             * 4K).  Keep the previous placeholder content and continue; only a
+             * fully stalled decoder (no output for a while) is an error. */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            RKContext *cc = s->ctx_id ? context_by_id(d, s->ctx_id) : NULL;
+            bool alive = cc && cc->frames_out > 0 &&
+                         (now.tv_sec - cc->last_out_ts.tv_sec) < 2;
+            if (alive) {
+                LOG("SyncSurface: DROPPED surface=0x%x (stale content, frames=%lld)",
+                    id, (long long)cc->frames_out);
+                done = 1;
+            } else {
+                LOG("SyncSurface: TIMEOUT surface=0x%x prime_fd=%d", id, s->prime_fd);
+            }
             break;
         }
         done = s->decoded;
