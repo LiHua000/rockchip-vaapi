@@ -89,6 +89,12 @@ typedef struct {
     MppApi      *mpi;
     MppCodingType coding;
 
+    /* External decode buffer group (DRM dma-heap, falling back to ION).
+     * Mirrors ffmpeg rkmppdec.c: MPP allocates its DPB / output buffers from
+     * this group so 4K decode does NOT eat the small kernel CMA pool
+     * (256 MB default), which otherwise exhausts mid-clip. */
+    MppBufferGroup ext_group;
+
     /* buffers collected between BeginPicture / EndPicture */
     VABufferID   pending[64];
     int          n_pending;
@@ -248,6 +254,8 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
             d->contexts[i].mpi->reset(d->contexts[i].mpp);
             mpp_destroy(d->contexts[i].mpp);
         }
+        if (d->contexts[i].ext_group)
+            mpp_buffer_group_put(d->contexts[i].ext_group);
         pthread_mutex_destroy(&d->contexts[i].jq_mtx);
         pthread_cond_destroy(&d->contexts[i].jq_not_empty);
         pthread_cond_destroy(&d->contexts[i].jq_not_full);
@@ -549,6 +557,20 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
          * which the worker retries after draining). */
         c->mpi->control(c->mpp, MPP_SET_INPUT_BLOCK, (MppParam)&block);
 
+        /* Route MPP's decode buffers (DPB + output) out of CMA into system
+         * dma-heap memory via an external group, like ffmpeg's rkmppdec. */
+        c->ext_group = NULL;
+        if (mpp_buffer_group_get_internal(&c->ext_group, MPP_BUFFER_TYPE_DRM) != MPP_OK)
+            mpp_buffer_group_get_internal(&c->ext_group, MPP_BUFFER_TYPE_ION);
+        if (c->ext_group) {
+            RK_S32 max_frames = 16;   /* mirrors rkmpp FRAMEGROUP_MAX_FRAMES */
+            mpp_buffer_group_limit_config(c->ext_group, 0, max_frames);
+            c->mpi->control(c->mpp, MPP_DEC_SET_EXT_BUF_GROUP, (MppParam)c->ext_group);
+            LOG("CreateContext: EXT_BUF_GROUP allocated (%p)", (void *)c->ext_group);
+        } else {
+            LOG("CreateContext: EXT_BUF_GROUP allocation FAILED (4K may fail)");
+        }
+
         /* decode worker pump */
         c->dec_d   = d;
         c->jq_head = c->jq_tail = c->jq_n = 0;
@@ -594,6 +616,7 @@ static VAStatus rk_DestroyContext(VADriverContextP ctx, VAContextID id) {
         c->mpi->reset(c->mpp);
         mpp_destroy(c->mpp);
     }
+    if (c->ext_group) { mpp_buffer_group_put(c->ext_group); c->ext_group = NULL; }
     pthread_mutex_destroy(&c->jq_mtx);
     pthread_cond_destroy(&c->jq_not_empty);
     pthread_cond_destroy(&c->jq_not_full);
