@@ -1179,14 +1179,10 @@ static VAStatus rk_SyncSurface(VADriverContextP ctx, VASurfaceID id) {
         if (rc == ETIMEDOUT) {
             /* One surface that MPP never delivered while the decoder is
              * otherwise alive = an occasional hardware frame drop (common at
-             * 4K).  Keep the previous placeholder content and continue; only a
-             * fully stalled decoder (no output for a while) is an error. */
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
+             * 4K).  Keep the previous placeholder content and continue; only
+             * a decoder that never produced ANY frame is an error. */
             RKContext *cc = s->ctx_id ? context_by_id(d, s->ctx_id) : NULL;
-            bool alive = cc && cc->frames_out > 0 &&
-                         (now.tv_sec - cc->last_out_ts.tv_sec) < 2;
-            if (alive) {
+            if (cc && cc->frames_out > 0) {
                 LOG("SyncSurface: DROPPED surface=0x%x (stale content, frames=%lld)",
                     id, (long long)cc->frames_out);
                 done = 1;
